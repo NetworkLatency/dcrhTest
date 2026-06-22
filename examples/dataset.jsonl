@@ -1,0 +1,2 @@
+{"id":"demo-1","question":"What is 17 + 25? Return the final answer in \\boxed{}.","answer":"42"}
+{"id":"demo-2","question":"If x+3=10, what is x? Return the final answer in \\boxed{}.","answer":"7"}

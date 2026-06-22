@@ -1,0 +1,30 @@
+# Python bytecode and local test state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+build/
+dist/
+SHA256SUMS
+*.egg-info/
+wheelhouse/
+
+# Experiment outputs and local runtime state
+outputs/
+references/
+server/vllm_logs/
+server/*.env
+!server/*.env.example
+
+# Local environments
+.venv/
+venv/
+env/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcrh-core"
+version = "0.1.0"
+description = "Offline core implementation of dual-channel rollback-handoff collaboration for Qwen3 reasoning models"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.4",
+  "transformers==4.57.6",
+  "tokenizers>=0.22,<0.23",
+  "safetensors>=0.4",
+  "numpy>=1.26",
+  "PyYAML>=6.0",
+  "tqdm>=4.66",
+  "accelerate>=0.33",
+  "packaging>=23",
+]
+
+[project.optional-dependencies]
+datasets = ["datasets>=2.20"]
+parquet = ["pandas>=2.0", "pyarrow>=14"]
+vllm = ["vllm==0.17.1"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+dcrh-calibrate = "dcrh.commands.calibrate:main"
+dcrh-threshold = "dcrh.commands.threshold:main"
+dcrh-run = "dcrh.commands.run:main"
+dcrh-baseline = "dcrh.commands.baseline:main"
+dcrh-summarize = "dcrh.commands.summarize:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,16 @@
+torch>=2.4
+transformers==4.57.6
+tokenizers>=0.22,<0.23
+safetensors>=0.4
+numpy>=1.26
+PyYAML>=6.0
+tqdm>=4.66
+accelerate>=0.33
+packaging>=23
+# Optional for datasets saved with datasets.save_to_disk():
+# datasets>=2.20
+# Optional for local parquet benchmark files:
+# pandas>=2.0
+# pyarrow>=14
+# Optional Linux/CUDA runtime for the planned two-process worker path:
+# vllm==0.17.1
