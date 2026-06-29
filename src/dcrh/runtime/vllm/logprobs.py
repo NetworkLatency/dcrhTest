@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
@@ -57,19 +56,17 @@ def raw_topk_values(logprobs: Any, k: int) -> list[float]:
     return [value for _, value in entries[:k]]
 
 
-def normalized_entropy_from_raw_values(values: Sequence[float], k: int | None = None) -> float:
-    if not values:
-        raise ValueError("values must be non-empty")
-    normalizer = int(k or len(values))
-    if normalizer < 2:
-        raise ValueError("Entropy normalizer must be >= 2")
+def top2_margin_from_raw_values(values: Sequence[float]) -> float:
+    """Return p_top1 - p_top2 after softmax over the supplied raw scores."""
+    if len(values) < 2:
+        raise ValueError("At least two raw values are required")
     arr = np.asarray(values, dtype=np.float64)
     arr = arr - np.max(arr)
     probs = np.exp(arr)
     probs = probs / probs.sum()
-    entropy = -float(np.sum(probs * np.log(np.clip(probs, 1e-300, None))))
-    return entropy / math.log(normalizer)
+    top2 = np.sort(probs)[-2:]
+    return float(top2[-1] - top2[-2])
 
 
-def normalized_entropy_from_vllm_logprobs(logprobs: Any, k: int) -> float:
-    return normalized_entropy_from_raw_values(raw_topk_values(logprobs, k), k=k)
+def top2_margin_from_vllm_logprobs(logprobs: Any, k: int) -> float:
+    return top2_margin_from_raw_values(raw_topk_values(logprobs, k))

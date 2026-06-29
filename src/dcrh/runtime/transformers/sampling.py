@@ -16,7 +16,7 @@ class SamplingParameters:
 
 
 class TokenSampler:
-    """Applies penalties and truncation only after raw-logit entropy is measured."""
+    """Applies generation penalties and truncation after boundary signals use raw logits."""
 
     def __init__(
         self,

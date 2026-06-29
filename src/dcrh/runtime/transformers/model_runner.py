@@ -13,16 +13,19 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .attention_backend import (
     BACKEND_NAME,
-    GroundingCollector,
-    central_layers,
+    RouteCollector,
+    RouteSummary,
     register_probe_attention_backend,
-    validate_selected_layers,
+    select_mdrv_route_layer,
 )
 from ...config import CostConfig, GenerationConfig, ModelConfig, PromptConfig, SignalConfig
-from ...core.boundaries import TokenObservation
+from ...core.router_signals import (
+    RegionSpans,
+    TpmMargin,
+    compute_tpm_from_logits,
+)
 from ...core.costs import CostLedger, synchronize_if_needed
 from ...prompt import PromptBuilder, PromptEncoding
-from .entropy import normalized_topk_entropy
 from .sampling import SamplingParameters, TokenSampler
 
 
@@ -56,14 +59,33 @@ class SessionPrefillInfo:
 
 
 @dataclass(slots=True)
+class TokenObservation:
+    token_id: int
+    text_piece: str
+    decode_seconds: float
+    sequence_length_after_token: int
+
+
+@dataclass(slots=True)
 class StepResult:
     observation: TokenObservation
     ended: bool
     end_reason: str | None
 
 
+@dataclass(slots=True)
+class BoundaryState:
+    next_token_logits: torch.Tensor
+    input_ids: torch.LongTensor
+    prefix_token_len: int
+    tpm_margin: TpmMargin
+    route_summary: RouteSummary | None
+    attention_available: bool
+    attention_unavailable_reason: str | None
+
+
 class LocalQwen3Runner:
-    """One local Qwen3 model with an online scalar attention probe."""
+    """One local Qwen3 model with MDRV boundary replay support."""
 
     def __init__(
         self,
@@ -113,29 +135,7 @@ class LocalQwen3Runner:
             )
         self.model.set_attn_implementation(BACKEND_NAME)
 
-        num_layers = int(self.model.config.num_hidden_layers)
-        selected = model_cfg.selected_layers or central_layers(num_layers, width=4)
-        self.selected_layers = validate_selected_layers(selected, num_layers)
-        layer_types = getattr(self.model.config, "layer_types", None)
-        if layer_types:
-            selected_types = {layer_types[i] for i in self.selected_layers}
-            if selected_types != {"full_attention"}:
-                raise ValueError(
-                    "Selected G layers must use full_attention so the original question remains visible. "
-                    f"Selected layer types: {selected_types}"
-                )
-        model_layers = getattr(getattr(self.model, "model", None), "layers", None)
-        if model_layers is not None:
-            sliding = {
-                i: getattr(model_layers[i].self_attn, "sliding_window", None)
-                for i in self.selected_layers
-            }
-            active_sliding = {i: v for i, v in sliding.items() if v not in (None, 0)}
-            if active_sliding:
-                raise ValueError(
-                    "Selected G layers use sliding-window attention and cannot observe the full "
-                    f"original question at long context: {active_sliding}"
-                )
+        self.route_layer = select_mdrv_route_layer(self.model.config)
 
         self.prompt_builder = PromptBuilder(
             tokenizer=self.tokenizer,
@@ -162,7 +162,7 @@ class LocalQwen3Runner:
             "num_attention_heads": int(self.model.config.num_attention_heads),
             "num_key_value_heads": int(self.model.config.num_key_value_heads),
             "head_dim": int(getattr(self.model.config, "head_dim")),
-            "selected_layers": self.selected_layers,
+            "mdrv_route_layer": self.route_layer,
             "dtype": str(self.dtype),
             "device": str(self.device),
             "transformers_config": json.loads(self.model.config.to_json_string()),
@@ -195,22 +195,6 @@ class LocalQwen3Runner:
             * int(sequence_length)
         )
 
-    def estimate_probe_qk_elements(self, sequence_length: int) -> int:
-        return int(
-            len(self.selected_layers)
-            * int(self.model.config.num_attention_heads)
-            * int(sequence_length)
-        )
-
-    def estimate_probe_score_buffer_bytes(self, sequence_length: int) -> int:
-        # Probe scores are float32 and materialized only for one query and one head chunk.
-        heads = min(
-            int(self.model.config.num_attention_heads),
-            int(self.signal_cfg.attention_head_chunk_size),
-        )
-        # Main temporary tensors are float32 score and softmax-weight chunks.
-        return int(2 * heads * int(sequence_length) * 4)
-
     def build_prompt(
         self,
         question: str,
@@ -224,6 +208,89 @@ class LocalQwen3Runner:
             device=self.device,
         )
 
+    def forward_boundary_state(
+        self,
+        prefix_text: str,
+        region_spans: RegionSpans | None = None,
+        collect_attention_route: bool = False,
+    ) -> BoundaryState:
+        """Replay a pre-action prefix and expose MDRV TPM plus optional route."""
+        if region_spans is not None and region_spans.input_ids:
+            input_ids = torch.tensor(
+                [list(region_spans.input_ids)],
+                dtype=torch.long,
+                device=self.device,
+            )
+        else:
+            encoded = self.tokenizer(
+                prefix_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            )
+            input_ids = encoded["input_ids"].to(self.device)
+        if input_ids.numel() == 0:
+            raise ValueError("Boundary prefix tokenization produced no tokens")
+
+        route_collector: RouteCollector | None = None
+        unavailable_reason: str | None = None
+        if collect_attention_route:
+            if self.route_layer is None:
+                unavailable_reason = "no_full_attention_layer"
+            elif region_spans is None:
+                unavailable_reason = "region_spans_missing"
+            else:
+                route_collector = RouteCollector(
+                    route_layer=self.route_layer,
+                    region_spans=region_spans.as_dict(),
+                    exclude_positions=(int(input_ids.shape[-1]) - 1,),
+                    head_chunk_size=self.signal_cfg.attention_head_chunk_size,
+                    epsilon=self.signal_cfg.route_epsilon,
+                    profile_with_cuda_sync=self.signal_cfg.profile_route_with_cuda_sync,
+                )
+                route_collector.begin_boundary()
+
+        synchronize_if_needed(
+            self.device, self.cost_cfg.synchronize_cuda_for_timing
+        )
+        try:
+            with torch.inference_mode():
+                outputs = self._forward(
+                    input_ids=input_ids,
+                    use_cache=False,
+                    dcrh_route_collector=route_collector,
+                )
+        except Exception as exc:
+            if route_collector is None:
+                raise
+            unavailable_reason = f"attention_unavailable:{type(exc).__name__}:{exc}"
+            route_collector = None
+            with torch.inference_mode():
+                outputs = self._forward(
+                    input_ids=input_ids,
+                    use_cache=False,
+                )
+        synchronize_if_needed(
+            self.device, self.cost_cfg.synchronize_cuda_for_timing
+        )
+
+        route_summary = None
+        if route_collector is not None:
+            try:
+                route_summary = route_collector.end_boundary()
+            except Exception as exc:
+                unavailable_reason = f"attention_unavailable:{type(exc).__name__}:{exc}"
+
+        logits = outputs.logits[0, -1].detach()
+        return BoundaryState(
+            next_token_logits=logits,
+            input_ids=input_ids.detach(),
+            prefix_token_len=int(input_ids.shape[-1]),
+            tpm_margin=compute_tpm_from_logits(logits, tokenizer=self.tokenizer),
+            route_summary=route_summary,
+            attention_available=route_summary is not None,
+            attention_unavailable_reason=unavailable_reason,
+        )
+
     def create_session(
         self,
         question: str,
@@ -231,7 +298,6 @@ class LocalQwen3Runner:
         control_text: str,
         purpose: str,
         ledger: CostLedger,
-        enable_grounding: bool = True,
         seed_key: str | None = None,
     ) -> "GenerationSession":
         encoding = self.build_prompt(question, shared_text, control_text)
@@ -252,7 +318,6 @@ class LocalQwen3Runner:
             purpose=purpose,
             ledger=ledger,
             seed=seed,
-            enable_grounding=enable_grounding,
         )
 
     def unload(self) -> None:
@@ -272,7 +337,6 @@ class GenerationSession:
         purpose: str,
         ledger: CostLedger,
         seed: int,
-        enable_grounding: bool = True,
     ) -> None:
         self.runner = runner
         self.prompt = prompt
@@ -280,23 +344,12 @@ class GenerationSession:
         self.ledger = ledger
         self.generated_ids: list[int] = []
         self.decode_seconds_by_token: list[float] = []
-        self.probe_seconds_by_token: list[float] = []
         self._past_key_values = None
         self._next_logits: torch.Tensor | None = None
         self._closed = False
         self._prefill_info: SessionPrefillInfo | None = None
-        self.enable_grounding = bool(enable_grounding)
         self._thinking_end_seen = False
         self._marker_buffer = ""
-        self.collector = GroundingCollector(
-            selected_layers=frozenset(runner.selected_layers),
-            question_start=prompt.question_start,
-            question_end=prompt.question_end,
-            sink_positions=prompt.sink_positions,
-            head_chunk_size=runner.signal_cfg.attention_head_chunk_size,
-            epsilon=runner.signal_cfg.grounding_epsilon,
-            profile_with_cuda_sync=runner.signal_cfg.profile_probe_with_cuda_sync,
-        )
         params = SamplingParameters(
             do_sample=runner.generation_cfg.do_sample,
             temperature=runner.generation_cfg.temperature,
@@ -378,23 +431,15 @@ class GenerationSession:
         if self.total_sequence_length >= int(self.runner.model.config.max_position_embeddings):
             dummy = TokenObservation(
                 token_id=-1,
-                entropy=0.0,
-                grounding=None,
                 text_piece="",
                 decode_seconds=0.0,
-                probe_seconds=0.0,
                 sequence_length_after_token=self.total_sequence_length,
             )
             return StepResult(dummy, ended=True, end_reason="max_context")
 
-        entropy = normalized_topk_entropy(
-            self._next_logits,
-            self.runner.signal_cfg.entropy_top_k,
-        )
         token_id = self.sampler.sample(self._next_logits)
         self.generated_ids.append(token_id)
         self.decode_seconds_by_token.append(0.0)
-        self.probe_seconds_by_token.append(0.0)
         self.ledger.record_sampled_token(self.runner.role, self.purpose)
         piece = self.runner.tokenizer.decode(
             [token_id],
@@ -406,18 +451,13 @@ class GenerationSession:
         if token_id in self.runner.eos_ids:
             observation = TokenObservation(
                 token_id=token_id,
-                entropy=entropy,
-                grounding=None,
                 text_piece=piece,
                 decode_seconds=0.0,
-                probe_seconds=0.0,
                 sequence_length_after_token=sequence_length,
             )
             return StepResult(observation, ended=True, end_reason="eos")
 
         token_tensor = torch.tensor([[token_id]], dtype=torch.long, device=self.runner.device)
-        if self.enable_grounding:
-            self.collector.begin_token()
         synchronize_if_needed(self.runner.device, self.runner.cost_cfg.synchronize_cuda_for_timing)
         started = time.perf_counter()
         forward_kwargs = dict(
@@ -425,53 +465,27 @@ class GenerationSession:
             past_key_values=self._past_key_values,
             use_cache=True,
         )
-        if self.enable_grounding:
-            forward_kwargs["dcrh_grounding_collector"] = self.collector
         with torch.inference_mode():
             outputs = self._forward(**forward_kwargs)
         synchronize_if_needed(self.runner.device, self.runner.cost_cfg.synchronize_cuda_for_timing)
         seconds = time.perf_counter() - started
-        if self.enable_grounding:
-            probe = self.collector.end_token()
-            grounding = probe.grounding
-            probe_seconds = probe.probe_seconds
-        else:
-            grounding = None
-            probe_seconds = 0.0
         self._past_key_values = outputs.past_key_values
         self._next_logits = outputs.logits[0, -1].detach()
         self.decode_seconds_by_token[-1] = seconds
-        self.probe_seconds_by_token[-1] = probe_seconds
-        probe_qk_elements = (
-            self.runner.estimate_probe_qk_elements(sequence_length)
-            if self.enable_grounding
-            else 0
-        )
-        probe_buffer_bytes = (
-            self.runner.estimate_probe_score_buffer_bytes(sequence_length)
-            if self.enable_grounding
-            else 0
-        )
         self.ledger.record_decode_forward(
             role=self.runner.role,
             purpose=self.purpose,
             sequence_length=sequence_length,
             seconds=seconds,
-            probe_seconds=probe_seconds,
             estimated_live_kv_bytes=self.runner.estimate_kv_bytes(sequence_length),
             attention_qk_elements_upper_bound=(
                 self.runner.estimate_decode_qk_elements_upper_bound(sequence_length)
             ),
-            probe_qk_elements=probe_qk_elements,
-            estimated_probe_score_buffer_bytes=probe_buffer_bytes,
         )
         observation = TokenObservation(
             token_id=token_id,
-            entropy=entropy,
-            grounding=grounding,
             text_piece=piece,
             decode_seconds=seconds,
-            probe_seconds=probe_seconds,
             sequence_length_after_token=sequence_length,
         )
         thinking_end = False
@@ -498,17 +512,11 @@ class GenerationSession:
 
     def generated_cost_slice(
         self, start_token: int = 0, end_token: int | None = None
-    ) -> tuple[float, float]:
+    ) -> float:
         end = len(self.generated_ids) if end_token is None else int(end_token)
         start = max(0, int(start_token))
         end = max(start, min(end, len(self.generated_ids)))
-        return (
-            float(sum(self.decode_seconds_by_token[start:end])),
-            float(sum(self.probe_seconds_by_token[start:end])),
-        )
-
-    def disable_grounding(self) -> None:
-        self.enable_grounding = False
+        return float(sum(self.decode_seconds_by_token[start:end]))
 
     def close(self) -> None:
         if self._closed:

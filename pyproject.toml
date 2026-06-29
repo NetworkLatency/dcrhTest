@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dcrh-core"
 version = "0.1.0"
-description = "Offline core implementation of dual-channel rollback-handoff collaboration for Qwen3 reasoning models"
+description = "Offline MDRV rollback collaboration router for Qwen3 reasoning models"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -27,8 +27,6 @@ vllm = ["vllm==0.17.1"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]
-dcrh-calibrate = "dcrh.commands.calibrate:main"
-dcrh-threshold = "dcrh.commands.threshold:main"
 dcrh-run = "dcrh.commands.run:main"
 dcrh-baseline = "dcrh.commands.baseline:main"
 dcrh-summarize = "dcrh.commands.summarize:main"

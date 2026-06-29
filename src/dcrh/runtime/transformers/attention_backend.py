@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import time
-import math
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Mapping
 
 import torch
+
+from ...core.router_signals import REGION_NAMES
 
 
 BACKEND_NAME = "dcrh_sdpa_probe"
@@ -13,34 +14,36 @@ _REGISTERED = False
 
 
 @dataclass(slots=True)
-class ProbeSummary:
-    grounding: float
-    observed_layers: int
+class RouteSummary:
+    route_distribution: dict[str, float]
+    observed_layer: int
     observed_heads: int
     probe_seconds: float
 
 
 @dataclass(slots=True)
-class GroundingCollector:
-    """Collects only question-attention mass; no attention matrix is retained."""
+class RouteCollector:
+    """Collects MDRV A/O/P/C route density from one full-attention layer."""
 
-    selected_layers: frozenset[int]
-    question_start: int
-    question_end: int
-    sink_positions: tuple[int, ...]
+    route_layer: int
+    region_spans: Mapping[str, tuple[int, int]]
+    exclude_positions: tuple[int, ...] = ()
     head_chunk_size: int = 4
-    epsilon: float = 1e-6
+    epsilon: float = 1e-12
     profile_with_cuda_sync: bool = False
-    _sum: float = field(init=False, default=0.0)
-    _count: int = field(init=False, default=0)
-    _layers_seen: set[int] = field(init=False, default_factory=set)
+    _density_sums: dict[str, float] = field(init=False)
+    _heads_seen: int = field(init=False, default=0)
+    _layer_seen: bool = field(init=False, default=False)
     _probe_seconds: float = field(init=False, default=0.0)
     active: bool = field(init=False, default=False)
 
-    def begin_token(self) -> None:
-        self._sum = 0.0
-        self._count = 0
-        self._layers_seen.clear()
+    def __post_init__(self) -> None:
+        self._density_sums = {name: 0.0 for name in REGION_NAMES}
+
+    def begin_boundary(self) -> None:
+        self._density_sums = {name: 0.0 for name in REGION_NAMES}
+        self._heads_seen = 0
+        self._layer_seen = False
         self._probe_seconds = 0.0
         self.active = True
 
@@ -57,17 +60,16 @@ class GroundingCollector:
         attention_mask: torch.Tensor | None,
         scaling: float,
     ) -> None:
-        if not self.active or module.layer_idx not in self.selected_layers:
+        if not self.active or module.layer_idx != self.route_layer:
             return
-        if query.shape[0] != 1 or query.shape[2] != 1:
-            raise RuntimeError(
-                "Grounding probing currently requires batch_size=1 and one-token decode forwards."
-            )
+        if query.shape[0] != 1:
+            raise RuntimeError("Route probing currently requires batch_size=1")
+
         key_length = int(key.shape[-2])
-        if self.question_end > key_length:
+        max_span_end = max(int(end) for _, end in self.region_spans.values())
+        if max_span_end > key_length:
             raise RuntimeError(
-                f"Question span [{self.question_start}, {self.question_end}) exceeds key length {key_length}. "
-                "This usually indicates a sliding-window cache on the selected layer."
+                f"Route span end {max_span_end} exceeds attention key length {key_length}"
             )
 
         self._sync_if_requested(query, self.profile_with_cuda_sync)
@@ -75,26 +77,20 @@ class GroundingCollector:
 
         num_q_heads = int(query.shape[1])
         groups = int(getattr(module, "num_key_value_groups", 1))
-        valid_sink = [p for p in self.sink_positions if 0 <= p < key_length]
-        sink_tensor = (
-            torch.tensor(valid_sink, dtype=torch.long, device=query.device)
-            if valid_sink
-            else None
-        )
-        valid_key_count = key_length - len(valid_sink)
-        question_count = self.question_end - self.question_start
-        if valid_key_count <= 0 or question_count <= 0:
-            raise RuntimeError("Invalid question or non-sink key count for grounding computation")
-
-        base_rate = min(
-            1.0 - self.epsilon,
-            max(self.epsilon, question_count / valid_key_count),
-        )
-        base_logit = math.log(base_rate / (1.0 - base_rate))
+        # MDRV only needs the boundary query row: the last query position.
+        query_row = query[:, :, -1:, :]
+        mask_row = None
+        if attention_mask is not None:
+            mask_row = attention_mask[:, :, -1:, :key_length]
+        excluded = {
+            position
+            for position in self.exclude_positions
+            if 0 <= int(position) < key_length
+        }
 
         for head_start in range(0, num_q_heads, self.head_chunk_size):
             head_end = min(num_q_heads, head_start + self.head_chunk_size)
-            q_chunk = query[:, head_start:head_end]
+            q_chunk = query_row[:, head_start:head_end]
             kv_indices = (
                 torch.arange(head_start, head_end, device=query.device, dtype=torch.long)
                 // groups
@@ -103,75 +99,88 @@ class GroundingCollector:
 
             scores = torch.matmul(q_chunk, k_chunk.transpose(-1, -2)) * scaling
             scores = scores.float()
-            if attention_mask is not None:
-                mask = attention_mask[:, :, :, :key_length]
-                if mask.dtype == torch.bool:
-                    scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
+            if mask_row is not None:
+                if mask_row.dtype == torch.bool:
+                    scores = scores.masked_fill(~mask_row, torch.finfo(scores.dtype).min)
                 else:
-                    scores = scores + mask.to(dtype=scores.dtype)
+                    scores = scores + mask_row.to(dtype=scores.dtype)
 
             weights = torch.softmax(scores, dim=-1, dtype=torch.float32)
-            question_mass = weights[
-                ..., self.question_start : self.question_end
-            ].sum(dim=-1)
-            if sink_tensor is None:
-                valid_mass = torch.ones_like(question_mass)
-            else:
-                sink_mass = weights.index_select(-1, sink_tensor).sum(dim=-1)
-                valid_mass = (1.0 - sink_mass).clamp_min(self.epsilon)
+            heads_in_chunk = head_end - head_start
+            for name in REGION_NAMES:
+                start, end = self.region_spans[name]
+                start = int(start)
+                end = int(end)
+                positions = [pos for pos in range(start, end) if pos not in excluded]
+                if not positions:
+                    continue
+                index = torch.tensor(positions, dtype=torch.long, device=weights.device)
+                density = weights.index_select(-1, index).mean(dim=-1)
+                self._density_sums[name] += float(density.sum().item())
+            self._heads_seen += heads_in_chunk
 
-            relative_mass = (question_mass / valid_mass).clamp(
-                min=self.epsilon, max=1.0 - self.epsilon
-            )
-            grounding = torch.logit(relative_mass) - base_logit
-            self._sum += float(grounding.sum().item())
-            self._count += grounding.numel()
+            del scores, weights
 
-            del scores, weights, question_mass, relative_mass, grounding
-
-        self._layers_seen.add(int(module.layer_idx))
+        self._layer_seen = True
         self._sync_if_requested(query, self.profile_with_cuda_sync)
         self._probe_seconds += time.perf_counter() - started
 
-    def end_token(self) -> ProbeSummary:
+    def end_boundary(self) -> RouteSummary:
         self.active = False
-        missing = self.selected_layers.difference(self._layers_seen)
-        if missing:
-            raise RuntimeError(
-                f"Grounding probe did not observe selected layers: {sorted(missing)}"
-            )
-        if self._count == 0:
-            raise RuntimeError("Grounding probe collected no attention heads")
-        return ProbeSummary(
-            grounding=self._sum / self._count,
-            observed_layers=len(self._layers_seen),
-            observed_heads=self._count,
+        if not self._layer_seen:
+            raise RuntimeError(f"Route probe did not observe layer {self.route_layer}")
+        if self._heads_seen <= 0:
+            raise RuntimeError("Route probe collected no attention heads")
+        densities = {
+            name: max(0.0, value / self._heads_seen)
+            for name, value in self._density_sums.items()
+        }
+        denom = sum(densities.values())
+        if denom <= self.epsilon:
+            route = {name: 0.0 for name in REGION_NAMES}
+        else:
+            route = {name: densities[name] / denom for name in REGION_NAMES}
+        return RouteSummary(
+            route_distribution=route,
+            observed_layer=self.route_layer,
+            observed_heads=self._heads_seen,
             probe_seconds=self._probe_seconds,
         )
 
 
-def central_layers(num_hidden_layers: int, width: int = 4) -> list[int]:
-    if num_hidden_layers < 1:
-        raise ValueError("num_hidden_layers must be positive")
-    width = max(1, min(width, num_hidden_layers))
-    start = max(0, (num_hidden_layers - width) // 2)
-    return list(range(start, start + width))
+def select_mdrv_route_layer(config) -> int | None:
+    """Select the last full-attention layer for MDRV route probing.
 
+    This follows the safeguard order requested for Qwen3-family models and never
+    intentionally selects a sliding-window layer.
+    """
+    num_layers = int(getattr(config, "num_hidden_layers", 0) or 0)
+    if num_layers <= 0:
+        return None
 
-def validate_selected_layers(layers: Iterable[int], num_hidden_layers: int) -> list[int]:
-    unique = sorted(set(int(x) for x in layers))
-    if not unique:
-        raise ValueError("At least one attention layer must be selected")
-    for layer in unique:
-        if layer < 0 or layer >= num_hidden_layers:
-            raise ValueError(
-                f"Attention layer {layer} is outside [0, {num_hidden_layers})"
-            )
-    return unique
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None:
+        candidates = [
+            index
+            for index, layer_type in enumerate(list(layer_types)[:num_layers])
+            if layer_type == "full_attention"
+        ]
+        return max(candidates) if candidates else None
+
+    use_sliding_window = getattr(config, "use_sliding_window", None)
+    sliding_window = getattr(config, "sliding_window", None)
+    if use_sliding_window is False or sliding_window is None:
+        return num_layers - 1
+
+    max_window_layers = getattr(config, "max_window_layers", None)
+    if max_window_layers is None:
+        return None
+    index = min(num_layers, int(max_window_layers)) - 1
+    return index if index >= 0 else None
 
 
 def register_probe_attention_backend() -> None:
-    """Register an SDPA backend that computes G online during one-token decoding."""
+    """Register an SDPA backend that can collect one MDRV route row."""
     global _REGISTERED
     if _REGISTERED:
         return
@@ -202,8 +211,8 @@ def register_probe_attention_backend() -> None:
         scaling: float | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
-        collector: GroundingCollector | None = kwargs.pop(
-            "dcrh_grounding_collector", None
+        route_collector: RouteCollector | None = kwargs.pop(
+            "dcrh_route_collector", None
         )
         output, _ = sdpa_attention_forward(
             module,
@@ -215,8 +224,8 @@ def register_probe_attention_backend() -> None:
             scaling=scaling,
             **kwargs,
         )
-        if collector is not None and collector.active:
-            collector.observe(
+        if route_collector is not None and route_collector.active:
+            route_collector.observe(
                 module=module,
                 query=query,
                 key=key,

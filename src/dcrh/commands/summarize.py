@@ -10,7 +10,7 @@ from ..utils.io import write_json
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Summarize DCRH JSONL results")
+    parser = argparse.ArgumentParser(description="Summarize MDRV JSONL results")
     parser.add_argument("--results", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

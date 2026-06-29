@@ -5,8 +5,8 @@ from dcrh.runtime.vllm import (
     WorkerCommand,
     WorkerGenerateRequest,
     command_from_json_line,
-    normalized_entropy_from_raw_values,
     raw_topk_values,
+    top2_margin_from_raw_values,
     to_json_line,
 )
 
@@ -26,9 +26,9 @@ def test_vllm_logprobs_use_rank_not_mapping_order():
     assert raw_topk_values(values, 2) == [3.0, 1.0]
 
 
-def test_entropy_from_raw_values_is_normalized():
-    entropy = normalized_entropy_from_raw_values([1.0, 1.0, 1.0, 1.0], k=4)
-    assert abs(entropy - 1.0) < 1e-12
+def test_top2_margin_from_raw_values():
+    margin = top2_margin_from_raw_values([2.0, 1.0, 0.0])
+    assert margin > 0.0
 
 
 def test_worker_command_round_trip():
@@ -50,7 +50,6 @@ def test_worker_command_round_trip():
             max_tokens=16,
         ),
         probe_mode="vllm_attention",
-        enable_grounding=True,
     )
     line = to_json_line(WorkerCommand(kind="generate", request=request))
     parsed = command_from_json_line(line)

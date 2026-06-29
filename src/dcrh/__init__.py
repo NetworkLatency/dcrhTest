@@ -1,3 +1,3 @@
-"""Dual-channel rollback-handoff collaboration core package."""
+"""MDRV rollback collaboration core package."""
 
 __version__ = "0.1.0"

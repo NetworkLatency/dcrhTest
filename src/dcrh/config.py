@@ -31,8 +31,6 @@ class ModelConfig:
     device: str
     dtype: DTypeName = "bfloat16"
     trust_remote_code: bool = False
-    selected_layers: list[int] | None = None
-    reference_path: str | None = None
     name: str | None = None
     backend: ModelBackend = "transformers"
     probe_mode: ProbeMode = "transformers"
@@ -62,10 +60,11 @@ class DataConfig:
 class PromptConfig:
     system_prompt: str = "You are a careful reasoning assistant."
     enable_thinking: bool = True
-    repair_cue: str = (
-        "\n\n[Expert repair]\n"
-        "Re-examine the original problem from the trusted prefix above. "
-        "Repair the reasoning and continue with a coherent derivation.\n\n"
+    takeover_cue: str = (
+        "\n\nYou are continuing a reasoning process. The previous small model reasoning "
+        "is trusted only up to the last provided step. Continue from that point and "
+        "solve the problem. Do not assume any later discarded reasoning is correct. "
+        "Put the final answer in \\boxed{}.\n\n"
     )
     sink_prefix_tokens: int = 1
     thinking_end_marker: str = "</think>"
@@ -81,39 +80,28 @@ class GenerationConfig:
     repetition_penalty: float = 1.0
     seed: int = 1234
     max_initial_slm_tokens: int = 8192
-    max_llm_repair_tokens: int = 4096
     max_llm_finish_tokens: int = 8192
-    max_slm_active_tokens_after_handoff: int = 4096
     max_final_answer_tokens: int = 2048
 
 
 @dataclass(slots=True)
 class SignalConfig:
-    entropy_top_k: int = 20
-    entropy_quantile: float = 0.9
-    attention_query_window: int = 32
     attention_head_chunk_size: int = 4
-    token_mass: int | None = None
-    pvalue_epsilon: float = 1e-6
-    grounding_epsilon: float = 1e-6
-    profile_probe_with_cuda_sync: bool = False
+    route_epsilon: float = 1e-12
+    profile_route_with_cuda_sync: bool = False
 
 
 @dataclass(slots=True)
 class ControllerConfig:
     alarm_threshold: float | None = None
-    threshold_path: str | None = None
-    ready_epsilon: float = 1e-8
 
 
 @dataclass(slots=True)
 class ProtocolConfig:
-    max_repair_episodes: int = 1
-    max_trial_attempts: int = 2
-    trial_blocks: int = 2
-    after_repair_budget: Literal["llm_finish", "keep_slm"] = "llm_finish"
-    include_discarded_suffix_in_llm_prompt: bool = False
-    llm_repair_monitor: Literal["h_only", "dual", "finish_directly"] = "h_only"
+    run_mode: Literal["offline_replay", "online_collaboration"] = "offline_replay"
+    route_discount: bool = True
+    takeover_mode: Literal["rollback", "current"] = "rollback"
+    attention_route_mode: Literal["last_layer_single_row", "none"] = "last_layer_single_row"
 
 
 @dataclass(slots=True)
@@ -121,15 +109,6 @@ class CostConfig:
     synchronize_cuda_for_timing: bool = True
     record_cuda_memory: bool = True
     record_attention_work_proxy: bool = True
-
-
-@dataclass(slots=True)
-class CalibrationConfig:
-    warmup_samples: int = 64
-    rank_samples: int = 256
-    budget_samples: int = 128
-    target_alarm_rate: float = 0.2
-    max_tokens_per_sample: int = 4096
 
 
 @dataclass(slots=True)
@@ -154,11 +133,10 @@ class ExperimentConfig:
     controller: ControllerConfig = field(default_factory=ControllerConfig)
     protocol: ProtocolConfig = field(default_factory=ProtocolConfig)
     cost: CostConfig = field(default_factory=CostConfig)
-    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
-    def validate(self, require_references: bool = False) -> None:
+    def validate(self, require_tau: bool = False) -> None:
         valid_data_formats = {"auto", "jsonl", "json", "csv", "tsv", "parquet", "hf_disk"}
         if self.data.format not in valid_data_formats:
             raise ValueError(
@@ -192,54 +170,28 @@ class ExperimentConfig:
                 raise ValueError(
                     f"models.{role}.worker_endpoint is required when backend='vllm_worker'"
                 )
-            if require_references and not model.reference_path:
-                raise ValueError(f"models.{role}.reference_path is required for the core run")
-            if require_references and model.reference_path and not Path(model.reference_path).exists():
-                raise FileNotFoundError(
-                    f"Reference file for {role} does not exist: {model.reference_path}"
-                )
         if not Path(self.data.path).exists():
             raise FileNotFoundError(f"Local dataset path does not exist: {self.data.path}")
-        if self.signals.entropy_top_k < 2:
-            raise ValueError("signals.entropy_top_k must be >= 2")
-        if not 0.0 < self.signals.entropy_quantile < 1.0:
-            raise ValueError("signals.entropy_quantile must be in (0, 1)")
-        if self.signals.attention_query_window < 1:
-            raise ValueError("signals.attention_query_window must be >= 1")
-        if self.signals.token_mass is not None and self.signals.token_mass < 1:
-            raise ValueError("signals.token_mass must be >= 1 when provided")
         if self.signals.attention_head_chunk_size < 1:
             raise ValueError("signals.attention_head_chunk_size must be >= 1")
+        if self.signals.route_epsilon <= 0.0:
+            raise ValueError("signals.route_epsilon must be positive")
         if self.prompt.enable_thinking and not self.prompt.thinking_end_marker:
             raise ValueError(
                 "prompt.thinking_end_marker must be non-empty when thinking mode is enabled"
             )
         if self.generation.max_final_answer_tokens < 1:
             raise ValueError("generation.max_final_answer_tokens must be >= 1")
-        if self.protocol.trial_blocks != 2:
+        if require_tau and self.controller.alarm_threshold is None:
+            raise ValueError("Set controller.alarm_threshold as the MDRV tau.")
+        if self.protocol.run_mode not in {"offline_replay", "online_collaboration"}:
+            raise ValueError("protocol.run_mode must be 'offline_replay' or 'online_collaboration'")
+        if self.protocol.takeover_mode not in {"rollback", "current"}:
+            raise ValueError("protocol.takeover_mode must be 'rollback' or 'current'")
+        if self.protocol.attention_route_mode not in {"last_layer_single_row", "none"}:
             raise ValueError(
-                "The core method fixes protocol.trial_blocks=2 because delta entropy requires two observations."
+                "protocol.attention_route_mode must be 'last_layer_single_row' or 'none'"
             )
-        if self.controller.alarm_threshold is None and self.controller.threshold_path is None:
-            if require_references:
-                raise ValueError(
-                    "Set controller.alarm_threshold or controller.threshold_path for the core run."
-                )
-        if require_references and self.controller.threshold_path and not Path(self.controller.threshold_path).exists():
-            raise FileNotFoundError(
-                f"controller.threshold_path does not exist: {self.controller.threshold_path}"
-            )
-        if self.protocol.max_repair_episodes != 1:
-            raise ValueError(
-                "The released core protocol fixes max_repair_episodes=1; additional loops are validation work."
-            )
-        valid_llm_monitors = {"h_only", "dual", "finish_directly"}
-        if self.protocol.llm_repair_monitor not in valid_llm_monitors:
-            raise ValueError(
-                f"protocol.llm_repair_monitor must be one of {sorted(valid_llm_monitors)}"
-            )
-        if not 0.0 < self.calibration.target_alarm_rate < 1.0:
-            raise ValueError("calibration.target_alarm_rate must be in (0, 1)")
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -270,7 +222,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
         controller=ControllerConfig(**raw.get("controller", {})),
         protocol=ProtocolConfig(**raw.get("protocol", {})),
         cost=CostConfig(**raw.get("cost", {})),
-        calibration=CalibrationConfig(**raw.get("calibration", {})),
         evaluation=EvaluationConfig(**raw.get("evaluation", {})),
         output=OutputConfig(**raw.get("output", {})),
     )

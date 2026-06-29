@@ -1,26 +1,38 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any, Sequence
 
 from ..config import ExperimentConfig
 from ..evaluation.data import Example
+from ..runtime.transformers.model_runner import LocalQwen3Runner
+from .boundaries import DoubleNewlineBoundaryDetector
 from .costs import CostLedger, reset_peak_memory
-from .monitor import MonitorEvent, SessionMonitor
-from .reference import EmpiricalReference
-from .sequential import ControllerUpdate
-
-if TYPE_CHECKING:
-    from ..runtime.transformers.model_runner import GenerationSession, LocalQwen3Runner
+from .router_signals import (
+    REGION_NAMES,
+    RegionSpans,
+    build_region_spans_from_token_ids,
+    find_first_content_token,
+)
+from .router_state import MdrvRouterState, MdrvStepRecord
 
 
 @dataclass(slots=True)
-class PhaseOutcome:
-    kind: str
-    session: GenerationSession
-    monitor: SessionMonitor
-    event: MonitorEvent | None
-    reason: str
+class StepBoundary:
+    step_index: int
+    start_token_index: int
+    end_token_index: int
+    token_ids: list[int]
+    text: str
+
+
+@dataclass(slots=True)
+class EffectiveBoundary:
+    spans: RegionSpans
+    skipped_token_ids: list[int]
+    action_token_offset: int | None
+    action_token_id: int | None
+    action_token_text: str | None
 
 
 @dataclass(slots=True)
@@ -30,8 +42,19 @@ class CoreRunResult:
     gold_answer: str | None
     final_text: str
     terminal_reason: str
-    repair_episodes: int
-    trial_attempts: int
+    final_source: str
+    triggered: bool
+    trigger_step: int | None
+    anchor_step: int | None
+    discarded_steps: list[int]
+    trigger_discarded_steps: list[int]
+    num_slm_steps: int
+    slm_generated_tokens: int
+    llm_generated_tokens: int
+    tau: float
+    mode: str
+    delimiter: str
+    per_step: list[dict[str, Any]]
     cost: dict[str, Any]
 
     def as_dict(self, save_full_text: bool = True) -> dict[str, Any]:
@@ -41,544 +64,409 @@ class CoreRunResult:
         return row
 
 
-def _block_payload(event: MonitorEvent, phase: str) -> dict[str, Any]:
-    assert event.block is not None
-    payload: dict[str, Any] = {
-        "phase": phase,
-        "block": asdict(event.block),
-    }
-    if event.update is not None:
-        payload["controller"] = asdict(event.update)
-    return payload
-
-
 class CoreProtocol:
-    """Detection -> rollback -> LLM repair -> SLM speculative handoff."""
+    """MDRV: Margin Drawdown with Route Velocity rollback takeover."""
 
     def __init__(
         self,
         cfg: ExperimentConfig,
         slm: LocalQwen3Runner,
         llm: LocalQwen3Runner,
-        slm_reference: EmpiricalReference,
-        llm_reference: EmpiricalReference,
         alarm_threshold: float,
     ) -> None:
         self.cfg = cfg
         self.slm = slm
         self.llm = llm
-        self.slm_reference = slm_reference
-        self.llm_reference = llm_reference
-        self.alarm_threshold = float(alarm_threshold)
+        self.tau = float(alarm_threshold)
+        self.delimiter = "\n\n"
+        if cfg.protocol.run_mode != "offline_replay":
+            raise NotImplementedError(
+                "MDRV currently implements offline_replay; online_collaboration is not wired yet."
+            )
 
-    def _new_monitor(
-        self,
-        session: GenerationSession,
-        reference: EmpiricalReference,
-        use_grounding_channel: bool = True,
-        require_grounding: bool | None = None,
-    ) -> SessionMonitor:
-        token_mass = (
-            self.cfg.signals.token_mass
-            if self.cfg.signals.token_mass is not None
-            else reference.token_mass
-        )
-        return SessionMonitor(
-            session=session,
-            token_mass=token_mass,
-            entropy_quantile=self.cfg.signals.entropy_quantile,
-            grounding_window=self.cfg.signals.attention_query_window,
-            reference=reference,
-            threshold=self.alarm_threshold,
-            pvalue_epsilon=self.cfg.signals.pvalue_epsilon,
-            use_entropy_channel=True,
-            use_grounding_channel=use_grounding_channel,
-            require_grounding=require_grounding,
+    def _decode(self, token_ids: Sequence[int]) -> str:
+        return self.slm.tokenizer.decode(
+            list(token_ids),
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )
 
-    def _run_slm_active(
+    def _run_slm_trace(
         self,
-        session: GenerationSession,
-        monitor: SessionMonitor,
+        example: Example,
         ledger: CostLedger,
-        max_tokens: int,
-        phase: str,
-        honor_alarm: bool = True,
-    ) -> PhaseOutcome:
-        for _ in range(max_tokens):
-            event = monitor.step(allow_alarm=honor_alarm)
-            if event.kind == "block":
-                ledger.transition("statistical_block", **_block_payload(event, phase))
-                if honor_alarm and event.update is not None and event.update.alarm:
-                    return PhaseOutcome("alarm", session, monitor, event, "dual_channel_alarm")
-            elif event.kind == "end":
-                return PhaseOutcome("end", session, monitor, event, event.end_reason or "end")
-        return PhaseOutcome("budget", session, monitor, None, "token_budget")
+    ) -> tuple[list[int], str, str, list[StepBoundary], str, Any]:
+        session = self.slm.create_session(
+            question=example.question,
+            shared_text="",
+            control_text="",
+            purpose="slm_mdrv_initial",
+            ledger=ledger,
+        )
+        detector = DoubleNewlineBoundaryDetector()
+        boundaries: list[StepBoundary] = []
+        previous_boundary = 0
+        terminal_reason = "slm_token_budget"
 
-    def _run_llm_until_ready(
-        self,
-        session: GenerationSession,
-        ledger: CostLedger,
-        max_tokens: int,
-        phase: str,
-    ) -> PhaseOutcome:
-        monitor_mode = self.cfg.protocol.llm_repair_monitor
-        use_grounding = monitor_mode == "dual"
-        monitor = self._new_monitor(
+        for _ in range(self.cfg.generation.max_initial_slm_tokens):
+            result = session.step()
+            observation = result.observation
+            if observation.token_id >= 0:
+                token_index = len(session.generated_ids)
+                boundary = detector.push(observation.text_piece, token_index)
+                if boundary is not None:
+                    token_ids = session.generated_ids[
+                        previous_boundary : boundary.token_index
+                    ]
+                    boundaries.append(
+                        StepBoundary(
+                            step_index=len(boundaries) + 1,
+                            start_token_index=previous_boundary,
+                            end_token_index=boundary.token_index,
+                            token_ids=[int(x) for x in token_ids],
+                            text=self._decode(token_ids),
+                        )
+                    )
+                    previous_boundary = boundary.token_index
+
+            if not result.ended:
+                continue
+            if result.end_reason == "thinking_end":
+                continue
+            terminal_reason = result.end_reason or "slm_generation_end"
+            break
+
+        prompt_ids = [int(x) for x in session.prompt.input_ids.reshape(-1).tolist()]
+        return (
+            [int(x) for x in session.generated_ids],
+            session.prompt.rendered_text,
+            session.generated_text(),
+            boundaries,
+            terminal_reason,
             session,
-            self.llm_reference,
-            use_grounding_channel=use_grounding,
-            require_grounding=use_grounding,
         )
-        for _ in range(max_tokens):
-            event = monitor.step(allow_alarm=False)
-            if event.kind == "block":
-                ledger.transition("statistical_block", **_block_payload(event, phase))
-                assert monitor.controller is not None
-                ready = (
-                    monitor_mode != "finish_directly"
-                    and monitor.controller.ready(
-                        minimum_blocks=2,
-                        epsilon=self.cfg.controller.ready_epsilon,
-                    )
-                )
-                if ready:
-                    reason = (
-                        "llm_channels_settled"
-                        if monitor_mode == "dual"
-                        else "llm_entropy_settled"
-                    )
-                    return PhaseOutcome("ready", session, monitor, event, reason)
-            elif event.kind == "end":
-                return PhaseOutcome("end", session, monitor, event, event.end_reason or "end")
-        return PhaseOutcome("budget", session, monitor, None, "llm_repair_budget")
 
-    def _run_slm_trial(
+    def _effective_boundary(
         self,
-        session: GenerationSession,
-        ledger: CostLedger,
-        phase: str,
-    ) -> PhaseOutcome:
-        monitor = self._new_monitor(session, self.slm_reference)
-        max_tokens = self.cfg.generation.max_slm_active_tokens_after_handoff
-        for _ in range(max_tokens):
-            event = monitor.step(allow_alarm=False)
-            if event.kind == "block":
-                ledger.transition("statistical_block", **_block_payload(event, phase))
-                assert monitor.controller is not None
-                if monitor.controller.blocks_seen >= self.cfg.protocol.trial_blocks:
-                    accepted = monitor.controller.ready(
-                        minimum_blocks=self.cfg.protocol.trial_blocks,
-                        epsilon=self.cfg.controller.ready_epsilon,
-                    )
-                    return PhaseOutcome(
-                        "accepted" if accepted else "rejected",
-                        session,
-                        monitor,
-                        event,
-                        "slm_trial_safe" if accepted else "slm_trial_realarms",
-                    )
-            elif event.kind == "end":
-                # A final answer produced during the trial is committed; no return decision remains.
-                return PhaseOutcome("end", session, monitor, event, event.end_reason or "end")
-        return PhaseOutcome("rejected", session, monitor, None, "slm_trial_budget")
+        prompt_ids: Sequence[int],
+        chunks: Sequence[StepBoundary],
+        all_generated_ids: Sequence[int],
+        boundary_end: int,
+    ) -> EffectiveBoundary:
+        continuation = [int(x) for x in all_generated_ids[boundary_end:]]
+        found = find_first_content_token(continuation, self.slm.tokenizer)
+        action_offset = None
+        action_token_id = None
+        action_token_text = None
+        skipped: list[int] = []
+        if found is not None:
+            action_offset, action_token_id, action_token_text = found
+            skipped = continuation[:action_offset]
 
-    def _run_llm_finish(
+        base_ids = [
+            *prompt_ids,
+            *(token for chunk in chunks for token in chunk.token_ids),
+        ]
+        effective_ids = [*base_ids, *skipped]
+        spans = build_region_spans_from_token_ids(
+            prompt_ids=prompt_ids,
+            chunk_ids=[chunk.token_ids for chunk in chunks],
+            input_ids=effective_ids,
+        )
+        return EffectiveBoundary(
+            spans=spans,
+            skipped_token_ids=skipped,
+            action_token_offset=action_offset,
+            action_token_id=action_token_id,
+            action_token_text=action_token_text,
+        )
+
+    def _route_for(
+        self,
+        spans: RegionSpans,
+        attention_enabled: bool,
+    ) -> tuple[dict[str, float] | None, bool, str | None, int | None]:
+        if not attention_enabled:
+            return None, False, None, None
+        state = self.slm.forward_boundary_state(
+            prefix_text="",
+            region_spans=spans,
+            collect_attention_route=True,
+        )
+        route = (
+            state.route_summary.route_distribution
+            if state.route_summary is not None
+            else None
+        )
+        layer = state.route_summary.observed_layer if state.route_summary is not None else None
+        return route, state.attention_available, state.attention_unavailable_reason, layer
+
+    def _step_record(
+        self,
+        boundary: StepBoundary,
+        effective: EffectiveBoundary,
+        prefix_token_len: int,
+        tpm_state,
+        route: dict[str, float] | None,
+        route_velocity: float | None,
+        bar_v: float | None,
+        risk: float,
+        margin_drawdown: float,
+        segment_start: int | None,
+        attention_available: bool,
+        attention_reason: str | None,
+        route_layer: int | None,
+        takeover: bool,
+    ) -> MdrvStepRecord:
+        values = {name: None for name in REGION_NAMES}
+        if route is not None:
+            values.update({name: float(route[name]) for name in REGION_NAMES})
+        tpm = tpm_state.tpm_margin
+        return MdrvStepRecord(
+            step_index=boundary.step_index,
+            step_text=boundary.text,
+            prefix_token_len=prefix_token_len,
+            action_token_offset=effective.action_token_offset,
+            skipped_action_tokens=len(effective.skipped_token_ids),
+            action_token_id=effective.action_token_id,
+            action_token_text=effective.action_token_text,
+            M_i=tpm.tpm_margin,
+            p_top1=tpm.p_top1,
+            p_top2=tpm.p_top2,
+            top1_token_id=tpm.top1_token_id,
+            top1_token_text=tpm.top1_token_text,
+            top2_token_id=tpm.top2_token_id,
+            top2_token_text=tpm.top2_token_text,
+            r_i_A=values["A"],
+            r_i_O=values["O"],
+            r_i_P=values["P"],
+            r_i_C=values["C"],
+            V_i=route_velocity,
+            G_i=margin_drawdown,
+            segment_start=segment_start,
+            barV=bar_v,
+            R_i=risk,
+            attention_available=attention_available,
+            attention_unavailable_reason=attention_reason,
+            route_layer=route_layer,
+            route_query_position=prefix_token_len - 1,
+            takeover_decision_at_step=takeover,
+        )
+
+    def _continue_llm(
         self,
         example: Example,
         shared_text: str,
         ledger: CostLedger,
-        purpose: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, int, str]:
         session = self.llm.create_session(
             question=example.question,
             shared_text=shared_text,
-            control_text="",
-            purpose=purpose,
+            control_text=self.cfg.prompt.takeover_cue,
+            purpose="llm_mdrv_takeover",
             ledger=ledger,
-            enable_grounding=False,
         )
-        text, reason = self._continue_live_session(
-            session=session,
-            base_shared_text=shared_text,
-            max_tokens=self.cfg.generation.max_llm_finish_tokens,
-            budget_reason="llm_finish_budget",
-        )
-        session.close()
-        return text, reason
-
-    def _continue_live_session(
-        self,
-        session: GenerationSession,
-        base_shared_text: str,
-        max_tokens: int,
-        budget_reason: str,
-    ) -> tuple[str, str]:
-        """Complete the answer from an existing cache; a thinking delimiter is not EOS."""
-        session.disable_grounding()
-        reason = budget_reason
-        for _ in range(max_tokens):
+        terminal = "llm_finish_budget"
+        for _ in range(self.cfg.generation.max_llm_finish_tokens):
             result = session.step()
             if not result.ended:
                 continue
             if result.end_reason == "thinking_end":
                 continue
-            reason = result.end_reason or "generation_end"
+            terminal = result.end_reason or "llm_generation_end"
             break
-        return base_shared_text + session.generated_text(), reason
-
-    def _rollback_and_start_llm(
-        self,
-        example: Example,
-        base_shared_text: str,
-        outcome: PhaseOutcome,
-        ledger: CostLedger,
-        repair_episode: int,
-    ) -> tuple[str, GenerationSession]:
-        if outcome.event is None or outcome.event.update is None:
-            raise RuntimeError("Rollback requires an alarm event")
-        update: ControllerUpdate = outcome.event.update
-        if update.onset_block is None:
-            raise RuntimeError("Alarm has no estimated onset block")
-        rollback_idx = outcome.monitor.rollback_token_index(update.onset_block)
-        detection_idx = len(outcome.session.generated_ids)
-        trusted_local = outcome.session.generated_text(rollback_idx)
-        detected_local = outcome.session.generated_text(detection_idx)
-        discarded_local = outcome.session.generated_text(detection_idx)[len(trusted_local) :]
-        trusted_shared = base_shared_text + trusted_local
-        detection_shared = base_shared_text + detected_local
-        discarded_tokens = detection_idx - rollback_idx
-        discarded_decode_seconds, discarded_probe_seconds = (
-            outcome.session.generated_cost_slice(rollback_idx, detection_idx)
-        )
-
-        ledger.mark_discarded_generation(
-            role="slm",
-            reason="rollback_suffix",
-            tokens=discarded_tokens,
-            characters=len(discarded_local),
-            decode_seconds=discarded_decode_seconds,
-            probe_seconds=discarded_probe_seconds,
-        )
-        ledger.transition(
-            "rollback",
-            trigger=update.trigger,
-            onset_block=update.onset_block,
-            detection_block=update.block_index,
-            rollback_generated_token_index=rollback_idx,
-            detection_generated_token_index=detection_idx,
-            discarded_slm_tokens=discarded_tokens,
-            discarded_slm_decode_seconds=discarded_decode_seconds,
-            discarded_slm_probe_seconds=discarded_probe_seconds,
-            trusted_text_characters=len(trusted_shared),
-        )
-
-        repair_control = self.cfg.prompt.repair_cue
-        if self.cfg.protocol.include_discarded_suffix_in_llm_prompt and discarded_local:
-            repair_control += (
-                "\n[Discarded provisional suffix; use only for diagnosis, do not copy it.]\n"
-                + discarded_local
-                + "\n[End discarded suffix]\n"
-            )
-        actual_encoding = self.llm.build_prompt(
-            example.question, trusted_shared, repair_control
-        )
-        detection_encoding = self.llm.build_prompt(
-            example.question, detection_shared, repair_control
-        )
-        ledger.record_rollback_tradeoff(
-            slm_discarded_tokens=discarded_tokens,
-            llm_actual_prefill_tokens=actual_encoding.total_tokens,
-            llm_detection_point_prefill_tokens=detection_encoding.total_tokens,
-            llm_actual_prefill_qk_elements_upper_bound=(
-                self.llm.estimate_prefill_qk_elements_upper_bound(
-                    actual_encoding.total_tokens
-                )
-            ),
-            llm_detection_point_qk_elements_upper_bound=(
-                self.llm.estimate_prefill_qk_elements_upper_bound(
-                    detection_encoding.total_tokens
-                )
-            ),
-            llm_actual_estimated_kv_bytes=self.llm.estimate_kv_bytes(
-                actual_encoding.total_tokens
-            ),
-            llm_detection_point_estimated_kv_bytes=self.llm.estimate_kv_bytes(
-                detection_encoding.total_tokens
-            ),
-        )
-        outcome.session.close()
-
-        llm_session = self.llm.create_session(
-            question=example.question,
-            shared_text=trusted_shared,
-            control_text=repair_control,
-            purpose=f"llm_upgrade_repair_{repair_episode}",
-            ledger=ledger,
-            enable_grounding=self.cfg.protocol.llm_repair_monitor == "dual",
-        )
-        # Only the fixed cue is committed to the public reasoning state. Optional diagnostic suffix is not.
-        committed_repair_base = trusted_shared + self.cfg.prompt.repair_cue
-        return committed_repair_base, llm_session
+        text = shared_text + session.generated_text()
+        generated_tokens = len(session.generated_ids)
+        session.close()
+        return text, generated_tokens, terminal
 
     def run(self, example: Example) -> CoreRunResult:
         devices = [str(self.slm.device), str(self.llm.device)]
         if self.cfg.cost.record_cuda_memory:
             reset_peak_memory(devices)
         ledger = CostLedger(self.cfg.cost.record_attention_work_proxy)
-        repair_episodes = 0
-        trial_attempts = 0
-        shared_text = ""
 
-        slm_session = self.slm.create_session(
-            question=example.question,
-            shared_text=shared_text,
-            control_text="",
-            purpose="slm_initial",
-            ledger=ledger,
+        (
+            generated_ids,
+            _prompt_text,
+            slm_text,
+            boundaries,
+            slm_terminal,
+            slm_session,
+        ) = self._run_slm_trace(example, ledger)
+        prompt_ids = [int(x) for x in slm_session.prompt.input_ids.reshape(-1).tolist()]
+
+        router = MdrvRouterState(
+            tau=self.tau,
+            route_discount=self.cfg.protocol.route_discount,
         )
-        slm_monitor = self._new_monitor(slm_session, self.slm_reference)
-        initial = self._run_slm_active(
-            session=slm_session,
-            monitor=slm_monitor,
-            ledger=ledger,
-            max_tokens=self.cfg.generation.max_initial_slm_tokens,
-            phase="SLM_ACTIVE_INITIAL",
-            honor_alarm=True,
-        )
-        if initial.kind != "alarm":
-            if initial.reason == "thinking_end":
-                final_text, terminal = self._continue_live_session(
-                    session=slm_session,
-                    base_shared_text=shared_text,
-                    max_tokens=self.cfg.generation.max_final_answer_tokens,
-                    budget_reason="slm_final_answer_budget",
+        effective: list[EffectiveBoundary] = []
+        records: list[MdrvStepRecord] = []
+        triggered = False
+        trigger_step: int | None = None
+        anchor_step: int | None = None
+
+        attention_mode = self.cfg.protocol.attention_route_mode
+        attention_enabled = attention_mode == "last_layer_single_row"
+        for boundary in boundaries:
+            current_effective = self._effective_boundary(
+                prompt_ids=prompt_ids,
+                chunks=boundaries[: boundary.step_index],
+                all_generated_ids=generated_ids,
+                boundary_end=boundary.end_token_index,
+            )
+            effective.append(current_effective)
+            tpm_state = self.slm.forward_boundary_state(
+                prefix_text="",
+                region_spans=current_effective.spans,
+                collect_attention_route=False,
+            )
+            margin_update = router.update_margin(
+                boundary.step_index,
+                tpm_state.tpm_margin.tpm_margin,
+            )
+
+            route = None
+            route_velocity = None
+            bar_v = None
+            risk = 0.0 if margin_update.margin_drawdown == 0.0 else margin_update.margin_drawdown
+            attention_available = False
+            attention_reason = None
+            route_layer = None
+
+            if margin_update.needs_attention and attention_enabled:
+                baseline_route = None
+                if margin_update.needs_baseline_route:
+                    baseline_index = boundary.step_index - 2
+                    if baseline_index >= 0:
+                        (
+                            baseline_route,
+                            baseline_available,
+                            baseline_reason,
+                            _baseline_layer,
+                        ) = self._route_for(
+                            effective[baseline_index].spans,
+                            attention_enabled=True,
+                        )
+                        if not baseline_available:
+                            attention_reason = baseline_reason
+                    else:
+                        attention_reason = "baseline_route_missing"
+                route, attention_available, current_reason, route_layer = self._route_for(
+                    current_effective.spans,
+                    attention_enabled=True,
                 )
-                reason = f"initial_slm_{terminal}"
+                if current_reason is not None:
+                    attention_reason = current_reason
+                if baseline_route is None and margin_update.needs_baseline_route:
+                    attention_available = False
+                route_velocity, bar_v, risk = router.route_discounted_risk(
+                    route=route,
+                    baseline_route=baseline_route,
+                    attention_available=attention_available,
+                )
+            elif margin_update.needs_attention:
+                route_velocity, bar_v, risk = router.route_discounted_risk(
+                    route=None,
+                    baseline_route=None,
+                    attention_available=False,
+                )
+
+            takeover = risk >= self.tau and margin_update.margin_drawdown > 0.0
+            records.append(
+                self._step_record(
+                    boundary=boundary,
+                    effective=current_effective,
+                    prefix_token_len=tpm_state.prefix_token_len,
+                    tpm_state=tpm_state,
+                    route=route,
+                    route_velocity=route_velocity,
+                    bar_v=bar_v,
+                    risk=risk,
+                    margin_drawdown=margin_update.margin_drawdown,
+                    segment_start=margin_update.segment_start,
+                    attention_available=attention_available,
+                    attention_reason=attention_reason,
+                    route_layer=route_layer,
+                    takeover=takeover,
+                )
+            )
+            if takeover:
+                triggered = True
+                trigger_step = boundary.step_index
+                anchor_step = margin_update.segment_start
+                break
+
+        final_source = "SLM"
+        final_text = slm_text
+        terminal_reason = slm_terminal
+        discarded_steps: list[int] = []
+        trigger_discarded_steps: list[int] = []
+        llm_generated_tokens = 0
+
+        if triggered and anchor_step is not None:
+            anchor_boundary = boundaries[anchor_step - 1]
+            if self.cfg.protocol.takeover_mode == "current" and trigger_step is not None:
+                takeover_boundary = boundaries[trigger_step - 1]
+                takeover_token_index = takeover_boundary.end_token_index
             else:
-                final_text = shared_text + slm_session.generated_text()
-                reason = f"initial_slm_{initial.reason}"
-            slm_session.close()
-            if self.cfg.cost.record_cuda_memory:
-                ledger.capture_gpu_memory(devices)
-            return CoreRunResult(
-                example_id=example.example_id,
-                question=example.question,
-                gold_answer=example.answer,
-                final_text=final_text,
-                terminal_reason=reason,
-                repair_episodes=repair_episodes,
-                trial_attempts=trial_attempts,
-                cost=ledger.summary(),
+                takeover_token_index = anchor_boundary.end_token_index
+            trusted_text = self._decode(generated_ids[:takeover_token_index])
+            discarded_steps = [
+                step.step_index
+                for step in boundaries
+                if step.end_token_index > takeover_token_index
+            ]
+            trigger_discarded_steps = list(range(anchor_step + 1, (trigger_step or anchor_step) + 1))
+            decode_seconds = slm_session.generated_cost_slice(
+                takeover_token_index,
+                len(generated_ids),
             )
-
-        repair_episodes += 1
-        repair_base, llm_session = self._rollback_and_start_llm(
-            example=example,
-            base_shared_text=shared_text,
-            outcome=initial,
-            ledger=ledger,
-            repair_episode=repair_episodes,
-        )
-
-        while True:
-            llm_outcome = self._run_llm_until_ready(
-                session=llm_session,
-                ledger=ledger,
-                max_tokens=self.cfg.generation.max_llm_repair_tokens,
-                phase=f"LLM_REPAIR_{repair_episodes}",
+            ledger.mark_discarded_generation(
+                role="slm",
+                reason="mdrv_rollback_suffix",
+                tokens=len(generated_ids) - takeover_token_index,
+                characters=len(slm_text) - len(trusted_text),
+                decode_seconds=decode_seconds,
             )
-            if llm_outcome.kind == "end":
-                if llm_outcome.reason == "thinking_end":
-                    final_text, terminal = self._continue_live_session(
-                        session=llm_session,
-                        base_shared_text=repair_base,
-                        max_tokens=self.cfg.generation.max_final_answer_tokens,
-                        budget_reason="llm_final_answer_budget",
-                    )
-                    reason = f"llm_repair_{terminal}"
-                else:
-                    final_text = repair_base + llm_session.generated_text()
-                    reason = f"llm_repair_{llm_outcome.reason}"
-                llm_session.close()
-                break
-            if llm_outcome.kind == "budget":
-                final_text, finish_reason = self._continue_live_session(
-                    session=llm_session,
-                    base_shared_text=repair_base,
-                    max_tokens=self.cfg.generation.max_llm_finish_tokens,
-                    budget_reason="llm_finish_after_repair_budget",
-                )
-                llm_session.close()
-                reason = finish_reason
-                break
-
-            candidate_shared = repair_base + llm_session.generated_text()
             ledger.transition(
-                "llm_ready_for_trial",
-                llm_generated_tokens=len(llm_session.generated_ids),
-                candidate_characters=len(candidate_shared),
+                "mdrv_takeover",
+                trigger_step=trigger_step,
+                anchor_step=anchor_step,
+                takeover_mode=self.cfg.protocol.takeover_mode,
+                discarded_steps=discarded_steps,
+                trigger_discarded_steps=trigger_discarded_steps,
+                tau=self.tau,
             )
-            # Enforce text-only handoff: drop the live LLM cache before SLM trial.
-            llm_session.close()
-
-            trial_attempts += 1
-            trial_session = self.slm.create_session(
-                question=example.question,
-                shared_text=candidate_shared,
-                control_text="",
-                purpose=f"slm_trial_{trial_attempts}",
-                ledger=ledger,
-            )
-            trial_outcome = self._run_slm_trial(
-                session=trial_session,
-                ledger=ledger,
-                phase=f"SLM_TRIAL_{trial_attempts}",
-            )
-
-            if trial_outcome.kind == "end":
-                if trial_outcome.reason == "thinking_end":
-                    final_text, terminal = self._continue_live_session(
-                        session=trial_session,
-                        base_shared_text=candidate_shared,
-                        max_tokens=self.cfg.generation.max_final_answer_tokens,
-                        budget_reason="slm_trial_final_answer_budget",
-                    )
-                    reason = f"slm_trial_{terminal}"
-                else:
-                    final_text = candidate_shared + trial_session.generated_text()
-                    reason = f"slm_trial_{trial_outcome.reason}"
-                trial_session.close()
-                break
-
-            if trial_outcome.kind == "rejected":
-                trial_text = trial_session.generated_text()
-                trial_decode_seconds, trial_probe_seconds = (
-                    trial_session.generated_cost_slice()
-                )
-                ledger.mark_discarded_generation(
-                    role="slm",
-                    reason="rejected_trial",
-                    tokens=len(trial_session.generated_ids),
-                    characters=len(trial_text),
-                    decode_seconds=trial_decode_seconds,
-                    probe_seconds=trial_probe_seconds,
-                )
-                ledger.mark_wasted_prefill(
-                    role="slm",
-                    purpose=trial_session.purpose,
-                    tokens=trial_session.prefill_info.tokens,
-                    seconds=trial_session.prefill_info.seconds,
-                )
-                ledger.transition(
-                    "slm_trial_rejected",
-                    attempt=trial_attempts,
-                    discarded_trial_tokens=len(trial_session.generated_ids),
-                    discarded_trial_decode_seconds=trial_decode_seconds,
-                    discarded_trial_probe_seconds=trial_probe_seconds,
-                    wasted_trial_prefill_tokens=trial_session.prefill_info.tokens,
-                )
-                trial_session.close()
-                if trial_attempts >= self.cfg.protocol.max_trial_attempts:
-                    final_text, finish_reason = self._run_llm_finish(
-                        example,
-                        candidate_shared,
-                        ledger,
-                        purpose="llm_finish_after_trial_limit",
-                    )
-                    reason = finish_reason
-                    break
-                # No LLM KV snapshot was retained; continuation requires full re-prefill.
-                repair_base = candidate_shared
-                llm_session = self.llm.create_session(
-                    question=example.question,
-                    shared_text=repair_base,
-                    control_text="",
-                    purpose=f"llm_resume_after_trial_reject_{trial_attempts}",
-                    ledger=ledger,
-                    enable_grounding=self.cfg.protocol.llm_repair_monitor == "dual",
-                )
-                continue
-
-            # Accepted trial: keep this live SLM cache and continue from the provisional blocks.
-            ledger.transition(
-                "slm_trial_accepted",
-                attempt=trial_attempts,
-                committed_trial_tokens=len(trial_session.generated_ids),
-            )
-            accepted_base = candidate_shared
-            active_outcome = self._run_slm_active(
-                session=trial_session,
-                monitor=trial_outcome.monitor,
-                ledger=ledger,
-                max_tokens=self.cfg.generation.max_slm_active_tokens_after_handoff,
-                phase="SLM_ACTIVE_AFTER_HANDOFF",
-                honor_alarm=True,
-            )
-            if active_outcome.kind != "alarm":
-                if active_outcome.reason == "thinking_end":
-                    final_text, terminal = self._continue_live_session(
-                        session=trial_session,
-                        base_shared_text=accepted_base,
-                        max_tokens=self.cfg.generation.max_final_answer_tokens,
-                        budget_reason="post_handoff_final_answer_budget",
-                    )
-                    reason = f"post_handoff_slm_{terminal}"
-                else:
-                    final_text = accepted_base + trial_session.generated_text()
-                    reason = f"post_handoff_slm_{active_outcome.reason}"
-                trial_session.close()
-                break
-
-            if self.cfg.protocol.after_repair_budget == "keep_slm":
-                tail = self._run_slm_active(
-                    session=trial_session,
-                    monitor=trial_outcome.monitor,
-                    ledger=ledger,
-                    max_tokens=self.cfg.generation.max_slm_active_tokens_after_handoff,
-                    phase="SLM_ACTIVE_IGNORING_SECOND_ALARM",
-                    honor_alarm=False,
-                )
-                if tail.reason == "thinking_end":
-                    final_text, terminal = self._continue_live_session(
-                        session=trial_session,
-                        base_shared_text=accepted_base,
-                        max_tokens=self.cfg.generation.max_final_answer_tokens,
-                        budget_reason="second_alarm_keep_slm_final_answer_budget",
-                    )
-                    reason = f"second_alarm_keep_slm_{terminal}"
-                else:
-                    final_text = accepted_base + trial_session.generated_text()
-                    reason = f"second_alarm_keep_slm_{tail.reason}"
-                trial_session.close()
-                break
-
-            # A second alarm does not start another repair-handoff loop. Roll back once and let LLM finish.
-            second_base, second_llm = self._rollback_and_start_llm(
+            final_text, llm_generated_tokens, terminal_reason = self._continue_llm(
                 example=example,
-                base_shared_text=accepted_base,
-                outcome=active_outcome,
+                shared_text=trusted_text,
                 ledger=ledger,
-                repair_episode=repair_episodes + 1,
             )
-            final_text, reason = self._continue_live_session(
-                session=second_llm,
-                base_shared_text=second_base,
-                max_tokens=self.cfg.generation.max_llm_finish_tokens,
-                budget_reason="llm_finish_after_second_alarm_budget",
-            )
-            second_llm.close()
-            break
+            final_source = "LLM"
 
+        slm_session.close()
         if self.cfg.cost.record_cuda_memory:
             ledger.capture_gpu_memory(devices)
+
         return CoreRunResult(
             example_id=example.example_id,
             question=example.question,
             gold_answer=example.answer,
             final_text=final_text,
-            terminal_reason=reason,
-            repair_episodes=repair_episodes,
-            trial_attempts=trial_attempts,
+            terminal_reason=terminal_reason,
+            final_source=final_source,
+            triggered=triggered,
+            trigger_step=trigger_step,
+            anchor_step=anchor_step,
+            discarded_steps=discarded_steps,
+            trigger_discarded_steps=trigger_discarded_steps,
+            num_slm_steps=len(boundaries),
+            slm_generated_tokens=len(generated_ids),
+            llm_generated_tokens=llm_generated_tokens,
+            tau=self.tau,
+            mode=self.cfg.protocol.run_mode,
+            delimiter=self.delimiter,
+            per_step=[asdict(record) for record in records],
             cost=ledger.summary(),
         )

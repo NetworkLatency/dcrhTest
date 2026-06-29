@@ -1,12 +1,11 @@
 """vLLM worker protocol and output parsing helpers."""
 
 from .logprobs import (
-    normalized_entropy_from_raw_values,
-    normalized_entropy_from_vllm_logprobs,
     raw_topk_values,
+    top2_margin_from_raw_values,
+    top2_margin_from_vllm_logprobs,
 )
 from .protocol import (
-    ProbeSpan,
     VllmSamplingRequest,
     WorkerCommand,
     WorkerEndEvent,
@@ -20,7 +19,6 @@ from .protocol import (
 )
 
 __all__ = [
-    "ProbeSpan",
     "VllmSamplingRequest",
     "WorkerCommand",
     "WorkerEndEvent",
@@ -30,8 +28,8 @@ __all__ = [
     "WorkerTokenEvent",
     "command_from_json_line",
     "event_line",
-    "normalized_entropy_from_raw_values",
-    "normalized_entropy_from_vllm_logprobs",
     "raw_topk_values",
+    "top2_margin_from_raw_values",
+    "top2_margin_from_vllm_logprobs",
     "to_json_line",
 ]

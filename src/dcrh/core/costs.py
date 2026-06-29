@@ -107,15 +107,11 @@ class CostLedger:
         purpose: str,
         sequence_length: int,
         seconds: float,
-        probe_seconds: float,
         estimated_live_kv_bytes: int,
         attention_qk_elements_upper_bound: int,
-        probe_qk_elements: int,
-        estimated_probe_score_buffer_bytes: int,
     ) -> None:
         self._add(role, purpose, "decode_forward_calls", 1)
         self._add(role, purpose, "decode_seconds", seconds)
-        self._add(role, purpose, "probe_seconds", probe_seconds)
         self.per_role[role]["max_estimated_live_kv_bytes"] = max(
             self.per_role[role]["max_estimated_live_kv_bytes"],
             float(estimated_live_kv_bytes),
@@ -127,16 +123,6 @@ class CostLedger:
                 "decode_attention_qk_elements_upper_bound",
                 attention_qk_elements_upper_bound,
             )
-            self._add(
-                role,
-                purpose,
-                "probe_attention_qk_elements",
-                probe_qk_elements,
-            )
-            self.per_role[role]["max_estimated_probe_score_buffer_bytes"] = max(
-                self.per_role[role]["max_estimated_probe_score_buffer_bytes"],
-                float(estimated_probe_score_buffer_bytes),
-            )
 
     def mark_discarded_generation(
         self,
@@ -145,68 +131,15 @@ class CostLedger:
         tokens: int,
         characters: int = 0,
         decode_seconds: float = 0.0,
-        probe_seconds: float = 0.0,
     ) -> None:
         self.counters["discarded_generated_tokens"] += int(tokens)
         self.counters[f"discarded_{reason}_tokens"] += int(tokens)
         self.counters[f"discarded_{reason}_characters"] += int(characters)
         self.counters[f"discarded_{reason}_decode_seconds"] += float(decode_seconds)
-        self.counters[f"discarded_{reason}_probe_seconds"] += float(probe_seconds)
         self.per_role[role]["discarded_generated_tokens"] += int(tokens)
         self.per_role[role][f"discarded_{reason}_tokens"] += int(tokens)
         self.per_role[role][f"discarded_{reason}_decode_seconds"] += float(
             decode_seconds
-        )
-        self.per_role[role][f"discarded_{reason}_probe_seconds"] += float(
-            probe_seconds
-        )
-
-    def mark_wasted_prefill(self, role: str, purpose: str, tokens: int, seconds: float) -> None:
-        self.counters["wasted_prefill_tokens"] += int(tokens)
-        self.counters["wasted_prefill_seconds"] += float(seconds)
-        self.per_role[role]["wasted_prefill_tokens"] += int(tokens)
-        self.per_role[role]["wasted_prefill_seconds"] += float(seconds)
-        self.per_purpose[purpose]["wasted_prefill_tokens"] += int(tokens)
-        self.per_purpose[purpose]["wasted_prefill_seconds"] += float(seconds)
-
-    def record_rollback_tradeoff(
-        self,
-        slm_discarded_tokens: int,
-        llm_actual_prefill_tokens: int,
-        llm_detection_point_prefill_tokens: int,
-        llm_actual_prefill_qk_elements_upper_bound: int,
-        llm_detection_point_qk_elements_upper_bound: int,
-        llm_actual_estimated_kv_bytes: int,
-        llm_detection_point_estimated_kv_bytes: int,
-    ) -> None:
-        saved = int(llm_detection_point_prefill_tokens) - int(llm_actual_prefill_tokens)
-        self.counters["rollback_slm_discarded_tokens"] += int(slm_discarded_tokens)
-        self.counters["llm_upgrade_actual_prefill_tokens"] += int(llm_actual_prefill_tokens)
-        self.counters["llm_detection_point_counterfactual_prefill_tokens"] += int(
-            llm_detection_point_prefill_tokens
-        )
-        self.counters["rollback_llm_prefill_tokens_saved"] += saved
-        self.counters["llm_upgrade_actual_prefill_qk_elements_upper_bound"] += int(
-            llm_actual_prefill_qk_elements_upper_bound
-        )
-        self.counters[
-            "llm_detection_point_counterfactual_prefill_qk_elements_upper_bound"
-        ] += int(llm_detection_point_qk_elements_upper_bound)
-        self.counters["rollback_llm_prefill_qk_elements_saved_upper_bound"] += int(
-            llm_detection_point_qk_elements_upper_bound
-            - llm_actual_prefill_qk_elements_upper_bound
-        )
-        self.counters["llm_upgrade_actual_estimated_live_kv_bytes"] = max(
-            self.counters["llm_upgrade_actual_estimated_live_kv_bytes"],
-            int(llm_actual_estimated_kv_bytes),
-        )
-        self.counters[
-            "llm_detection_point_counterfactual_estimated_live_kv_bytes"
-        ] = max(
-            self.counters[
-                "llm_detection_point_counterfactual_estimated_live_kv_bytes"
-            ],
-            int(llm_detection_point_estimated_kv_bytes),
         )
 
     def transition(self, name: str, **payload: Any) -> None:

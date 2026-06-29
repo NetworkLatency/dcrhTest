@@ -2,33 +2,25 @@ models:
   slm:
     name: Qwen3-1.7B
     path: /ABSOLUTE/PATH/TO/Qwen3-1.7B
-    # transformers = current local reference runner.
-    # vllm_worker = external DCRH worker wrapping a vLLM engine.
+    # transformers = current local MDRV runner.
+    # vllm_worker = reserved external worker route.
     backend: transformers
-    # transformers: online Transformers SDPA hook.
-    # transformers_replay: vLLM generation plus slow Transformers G replay.
-    # vllm_attention: G from a vLLM attention probe backend.
-    # none: no grounding signal.
+    # transformers: local MDRV boundary replay.
+    # none: generation only.
     probe_mode: transformers
     worker_endpoint: null
     device: cuda:0
     dtype: bfloat16
     trust_remote_code: false
-    # null => central four full-attention layers
-    selected_layers: null
-    reference_path: /ABSOLUTE/PATH/TO/references/qwen3_1p7b_reference.npz
   llm:
     name: Qwen3-4B
     path: /ABSOLUTE/PATH/TO/Qwen3-4B
     backend: transformers
-    # LLM_REPAIR defaults to H-only, so the LLM usually does not need G.
     probe_mode: none
     worker_endpoint: null
     device: cuda:1
     dtype: bfloat16
     trust_remote_code: false
-    selected_layers: null
-    reference_path: /ABSOLUTE/PATH/TO/references/qwen3_4b_reference.npz
 
 data:
   # Generic local JSONL: one object per line with id/question/answer fields.
@@ -49,7 +41,7 @@ prompt:
   enable_thinking: true
   thinking_end_marker: "</think>"
   sink_prefix_tokens: 1
-  repair_cue: "\n\n[Expert repair]\nRe-examine the original problem from the trusted prefix above. Repair the reasoning and continue with a coherent derivation.\n\n"
+  takeover_cue: "\n\nYou are continuing a reasoning process. The previous small model reasoning is trusted only up to the last provided step. Continue from that point and solve the problem. Do not assume any later discarded reasoning is correct. Put the final answer in \\boxed{}.\n\n"
 
 generation:
   do_sample: true
@@ -60,51 +52,28 @@ generation:
   repetition_penalty: 1.0
   seed: 1234
   max_initial_slm_tokens: 8192
-  max_llm_repair_tokens: 4096
   max_llm_finish_tokens: 8192
-  max_slm_active_tokens_after_handoff: 4096
   max_final_answer_tokens: 2048
 
 signals:
-  entropy_top_k: 20
-  entropy_quantile: 0.9
-  attention_query_window: 32
   attention_head_chunk_size: 4
-  # null => use each model's unlabeled-calibration median token mass.
-  token_mass: null
-  pvalue_epsilon: 1.0e-6
-  grounding_epsilon: 1.0e-6
-  profile_probe_with_cuda_sync: false
+  route_epsilon: 1.0e-12
+  profile_route_with_cuda_sync: false
 
 controller:
-  # Use either a literal scalar or a JSON emitted by dcrh-calibrate.
+  # MDRV takeover budget threshold tau.
   alarm_threshold: null
-  threshold_path: /ABSOLUTE/PATH/TO/references/qwen3_1p7b_threshold.json
-  ready_epsilon: 1.0e-8
 
 protocol:
-  # The released core intentionally fixes one repair-handoff episode.
-  max_repair_episodes: 1
-  max_trial_attempts: 2
-  # Fixed at two: delta entropy is undefined with only one trial block.
-  trial_blocks: 2
-  # h_only is the default research setting: LLM repair length is entropy-settled,
-  # while SLM escalation and SLM trial remain dual-channel.
-  llm_repair_monitor: h_only
-  after_repair_budget: llm_finish
-  include_discarded_suffix_in_llm_prompt: false
+  run_mode: offline_replay
+  route_discount: true
+  takeover_mode: rollback
+  attention_route_mode: last_layer_single_row
 
 cost:
   synchronize_cuda_for_timing: true
   record_cuda_memory: true
   record_attention_work_proxy: true
-
-calibration:
-  warmup_samples: 64
-  rank_samples: 256
-  budget_samples: 128
-  target_alarm_rate: 0.2
-  max_tokens_per_sample: 4096
 
 evaluation:
   verifier: auto

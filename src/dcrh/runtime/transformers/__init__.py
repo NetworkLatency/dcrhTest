@@ -1,1 +1,1 @@
-"""Local Transformers runtime used as the current reference backend."""
+"""Local Transformers runtime used by the current MDRV implementation."""

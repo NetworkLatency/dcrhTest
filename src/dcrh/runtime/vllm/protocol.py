@@ -25,13 +25,6 @@ class VllmSamplingRequest:
 
 
 @dataclass(slots=True)
-class ProbeSpan:
-    question_start: int
-    question_end: int
-    sink_positions: list[int]
-
-
-@dataclass(slots=True)
 class WorkerGenerateRequest:
     request_id: str
     role: str
@@ -41,7 +34,6 @@ class WorkerGenerateRequest:
     purpose: str
     sampling: VllmSamplingRequest
     probe_mode: ProbeMode = "none"
-    enable_grounding: bool = False
     seed_key: str | None = None
 
 
@@ -57,12 +49,9 @@ class WorkerTokenEvent:
     request_id: str
     token_id: int
     text_piece: str
-    entropy: float
-    grounding: float | None
     token_index: int
     sequence_length_after_token: int
     decode_seconds: float
-    probe_seconds: float
 
 
 @dataclass(slots=True)

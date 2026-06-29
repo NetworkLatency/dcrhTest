@@ -1,23 +1,22 @@
-# DCRH Core 离线运行说明
+# MDRV Core 离线运行说明
 
-该版本只实现第一轮核心实验：Qwen3-1.7B 作为 SLM，Qwen3-4B 作为 LLM；模型均冻结，不训练路由器。系统只保存文本、token offset 和标量统计，不保存边界 KV 快照。
+当前项目默认方法是 MDRV。包名和脚本名仍保留 `dcrh` / `dcrh-run`，用于兼容已有运行环境。
 
-## 1. 环境与目录
+## 1. 准备目录
 
-建议在有网络的机器准备依赖 wheel，然后整体复制到离线服务器。离线服务器上的目录可以类似：
+离线服务器上建议准备：
 
 ```text
 /work/models/Qwen3-1.7B/
 /work/models/Qwen3-4B/
-/work/data/calibration.jsonl
 /work/data/evaluation.jsonl
 /work/dcrh_core/
 /work/wheelhouse/
 ```
 
-模型目录必须包含本地 `config.json`、tokenizer、generation config 和权重分片。代码会设置 Hugging Face 离线环境变量，并对模型/tokenizer 使用 `local_files_only=True`。
+模型目录必须包含本地 `config.json`、tokenizer、generation config 和权重文件。代码会使用 Hugging Face 离线模式和 `local_files_only=True`，不会主动下载模型或数据。
 
-安装：
+安装示例：
 
 ```bash
 python -m venv .venv
@@ -26,26 +25,19 @@ pip install --no-index --find-links /work/wheelhouse -r requirements.txt
 pip install --no-index --no-deps /work/dcrh_core/dist/dcrh_core-0.1.0-py3-none-any.whl
 ```
 
-运行前检查：
-
-```bash
-python scripts/check_offline.py \
-  --config /work/configs/evaluation.yaml
-```
-
 ## 2. 数据格式
 
-JSONL 每行一个样本：
+通用 JSONL 每行一个样本：
 
 ```json
 {"id":"math-0001","question":"题目文本","answer":"42"}
 ```
 
-校准集不读取答案，但应与评测集按题目划分，避免同题复用。校准和评测建议分别准备 YAML，只修改 `data.path` 与 `output.directory`。
+字段名可以在 YAML 中通过 `data.id_field`、`data.question_field`、`data.answer_field` 修改。AIME/GPQA 适配器可以通过 `data.dataset` 启用。
 
 ## 3. 修改配置
 
-复制 `configs/qwen3_1p7b_4b_core.yaml`，将以下字段改成绝对本地路径：
+复制 `configs/qwen3_1p7b_4b_core.yaml`，至少修改：
 
 ```yaml
 models:
@@ -57,45 +49,31 @@ models:
     device: cuda:1
 
 data:
-  path: /work/data/calibration.jsonl
+  path: /work/data/evaluation.jsonl
+
+controller:
+  alarm_threshold: 0.15
 
 output:
-  directory: /work/outputs/dcrh_core
+  directory: /work/outputs/mdrv_core
 ```
 
-两张 GPU 是推荐配置。单卡时可把两个 `device` 都设为 `cuda:0`，但两个模型权重会同时驻留；代码当前不做 CPU/磁盘换入换出。
+`controller.alarm_threshold` 就是 MDRV 的 `tau`。第一版的边界信号在 replay 时直接计算，只需要在配置中设置这个阈值。
 
-## 4. 无标签校准
-
-### SLM：建立经验分布并选择一个阈值 B
+运行前检查：
 
 ```bash
-python scripts/calibrate.py \
-  --config /work/configs/calibration.yaml \
-  --role slm \
-  --reference-out /work/references/qwen3_1p7b_reference.npz \
-  --threshold-out /work/references/qwen3_1p7b_threshold.json
+python scripts/check_offline.py \
+  --config /work/configs/evaluation.yaml
 ```
 
-### LLM：建立自身 H/G 经验分布
-
-```bash
-python scripts/calibrate.py \
-  --config /work/configs/calibration.yaml \
-  --role llm \
-  --reference-out /work/references/qwen3_4b_reference.npz \
-  --threshold-out /work/references/qwen3_4b_unused_threshold.json
-```
-
-LLM 不使用升级阈值；第二个 JSON 仅记录校准信息。把两个 reference 路径和 SLM threshold 路径写回评测 YAML。
-
-## 5. 核心实验
+## 4. 核心实验
 
 ```bash
 python scripts/run.py --config /work/configs/evaluation.yaml
 ```
 
-中断后再次执行会按 `example_id` 跳过已完成样本。单样本失败默认终止；需要记录错误并继续时增加：
+中断后再次执行会按 `example_id` 跳过已完成样本。需要记录错误并继续时：
 
 ```bash
 python scripts/run.py \
@@ -103,15 +81,18 @@ python scripts/run.py \
   --continue-on-error
 ```
 
-汇总：
+输出目录包含：
 
-```bash
-python scripts/summarize.py \
-  --results /work/outputs/dcrh_core/results.jsonl \
-  --output /work/outputs/dcrh_core/summary.json
+```text
+resolved_config.yaml
+run_metadata.json
+results.jsonl
+errors.jsonl
 ```
 
-同一解码器下的 SLM-only / LLM-only 基线：
+## 5. 基线与汇总
+
+SLM-only / LLM-only：
 
 ```bash
 python scripts/baseline.py \
@@ -125,34 +106,31 @@ python scripts/baseline.py \
   --max-tokens 16384
 ```
 
-基线关闭 G probe，但仍记录真实 prefill、decode、KV 估计和峰值显存。
+汇总：
 
-## 6. 成本统计字段
+```bash
+python scripts/summarize.py \
+  --results /work/outputs/mdrv_core/results.jsonl \
+  --output /work/outputs/mdrv_core/summary.json
+```
 
-每个结果的 `cost` 对象包含：
+## 6. 结果字段
 
-- `prefills`：每次真实 prefill 的角色、用途、token 数、耗时、估计实时 K+V 字节数；
-- `discarded_rollback_suffix_tokens`：变点确认前已经生成、回滚后丢弃的 SLM token；
-- `discarded_rollback_suffix_decode_seconds`：上述 token 对应的实测 decode forward 时间；
-- `discarded_rejected_trial_tokens`：接管试运行失败后丢弃的 SLM token；
-- `wasted_prefill_tokens/seconds`：失败 trial 已支付但没有进入最终轨迹的 SLM prefill；
-- `llm_upgrade_actual_prefill_tokens`：LLM 在回滚点 `[0, τ̂]` 上的实际 prefill 长度；
-- `llm_detection_point_counterfactual_prefill_tokens`：若不回滚、从报警点升级时的反事实长度；
-- `rollback_llm_prefill_tokens_saved`：回滚带来的 LLM prefill token 节省；
-- `probe_attention_qk_elements`：为计算 G 在选定层显式重算的 QK 元素数；
-- `gpu_memory`：每张 CUDA 设备的峰值 allocated/reserved memory；
-- `kv_policy: live_session_only_no_snapshots`：确认不存在边界 KV 归档。
+每个样本会记录：
 
-`prefill_attention_qk_elements_upper_bound` 和 `decode_attention_qk_elements_upper_bound` 是稠密注意力工作量上界，不是 FLOPs。论文中的系统结论应以同步端到端时延、prefill token、生成 token 和峰值显存为主。
+- `triggered`、`trigger_step`、`anchor_step`：MDRV 是否接管以及接管位置；
+- `discarded_steps`：回滚后丢弃的 SLM chunk；
+- `per_step`：每个边界的 TPM、route、drawdown、risk 和 attention 可用性；
+- `cost.prefills`：真实 prefill 调用；
+- `cost.counters.discarded_mdrv_rollback_suffix_tokens`：回滚丢弃的 SLM token；
+- `cost.kv_policy: live_session_only_no_snapshots`：确认不保存边界 KV 快照。
 
 ## 7. 运行前建议
 
-先把校准规模改小，使用 8–16 道题完成端到端冒烟测试；确认：
+先用少量样本冒烟测试，确认：
 
-1. 能观察到 `"\n\n"` 原子边界；
-2. reference 文件内三组分布非空；
-3. `results.jsonl` 中确实出现 SLM、LLM、trial 的 prefill 记录；
-4. 回滚样本的实际 LLM prefill 小于报警点反事实 prefill；
-5. rejected trial 的 prefill 和生成开销被计入 waste 字段。
-
-完成后再恢复正式校准规模。
+1. 配置可以加载，模型和数据路径均为本地路径；
+2. 结果中能看到 `"\n\n"` 边界对应的 `per_step`；
+3. `controller.alarm_threshold` 已设置；
+4. 如果 attention 不可用，`per_step` 中会记录原因，并回退到 TPM-only；
+5. 输出目录可以断点续跑。

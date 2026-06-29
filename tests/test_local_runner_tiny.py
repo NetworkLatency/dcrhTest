@@ -1,10 +1,17 @@
 from pathlib import Path
 
-import torch
+import pytest
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
-from transformers import PreTrainedTokenizerFast, Qwen3Config, Qwen3ForCausalLM
+
+pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+PreTrainedTokenizerFast = transformers.PreTrainedTokenizerFast
+Qwen3Config = getattr(transformers, "Qwen3Config", None)
+Qwen3ForCausalLM = getattr(transformers, "Qwen3ForCausalLM", None)
+if Qwen3Config is None or Qwen3ForCausalLM is None:
+    pytest.skip("Qwen3 classes require the pinned Transformers version", allow_module_level=True)
 
 from dcrh.config import CostConfig, GenerationConfig, ModelConfig, PromptConfig, SignalConfig
 from dcrh.core.costs import CostLedger
@@ -66,7 +73,7 @@ def test_local_only_runner_one_step(tmp_path: Path):
         model_cfg=ModelConfig(path=str(tmp_path), device="cpu", dtype="float32"),
         prompt_cfg=PromptConfig(system_prompt="You are helpful", enable_thinking=False),
         generation_cfg=GenerationConfig(do_sample=False, max_initial_slm_tokens=2),
-        signal_cfg=SignalConfig(entropy_top_k=5),
+        signal_cfg=SignalConfig(),
         cost_cfg=CostConfig(synchronize_cuda_for_timing=False),
     )
     ledger = CostLedger()
@@ -79,9 +86,7 @@ def test_local_only_runner_one_step(tmp_path: Path):
     )
     step = session.step()
     assert step.observation.token_id >= 0
-    assert step.observation.grounding is None or torch.isfinite(
-        torch.tensor(step.observation.grounding)
-    )
+    assert isinstance(step.observation.text_piece, str)
     assert ledger.summary()["counters"]["prefill_calls"] == 1
     session.close()
 

@@ -1,15 +1,22 @@
-import torch
-from transformers import Qwen3Config, Qwen3ForCausalLM
+import pytest
+
+torch = pytest.importorskip("torch")
+transformers = pytest.importorskip("transformers")
+Qwen3Config = getattr(transformers, "Qwen3Config", None)
+Qwen3ForCausalLM = getattr(transformers, "Qwen3ForCausalLM", None)
+if Qwen3Config is None or Qwen3ForCausalLM is None:
+    pytest.skip("Qwen3 classes require the pinned Transformers version", allow_module_level=True)
 
 from dcrh.runtime.transformers.attention_backend import (
     BACKEND_NAME,
-    GroundingCollector,
+    RouteCollector,
     register_probe_attention_backend,
+    select_mdrv_route_layer,
 )
+from dcrh.core.router_signals import compute_attention_route
 
 
-def test_selective_online_grounding_probe():
-    register_probe_attention_backend()
+def test_select_mdrv_route_layer_safeguards():
     config = Qwen3Config(
         vocab_size=100,
         hidden_size=32,
@@ -20,35 +27,33 @@ def test_selective_online_grounding_probe():
         head_dim=8,
         max_position_embeddings=128,
     )
-    model = Qwen3ForCausalLM(config).eval()
-    model.set_attn_implementation(BACKEND_NAME)
-    prefix = torch.randint(0, 100, (1, 10))
-    with torch.inference_mode():
-        first = model(prefix, use_cache=True, logits_to_keep=1)
-        collector = GroundingCollector(
-            selected_layers=frozenset({1, 2}),
-            question_start=2,
-            question_end=5,
-            sink_positions=(0,),
-            head_chunk_size=2,
-        )
-        collector.begin_token()
-        model(
-            torch.randint(0, 100, (1, 1)),
-            past_key_values=first.past_key_values,
-            use_cache=True,
-            logits_to_keep=1,
-            dcrh_grounding_collector=collector,
-        )
-        summary = collector.end_token()
-    assert summary.observed_layers == 2
-    assert summary.observed_heads == 8
-    assert torch.isfinite(torch.tensor(summary.grounding))
+    config.layer_types = [
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "full_attention",
+    ]
+    assert select_mdrv_route_layer(config) == 3
+    config.layer_types = []
+    assert select_mdrv_route_layer(config) is None
+
+    config.layer_types = None
+    config.use_sliding_window = False
+    config.sliding_window = None
+    assert select_mdrv_route_layer(config) == 3
+
+    config.use_sliding_window = True
+    config.sliding_window = 16
+    config.max_window_layers = 2
+    assert select_mdrv_route_layer(config) == 1
+
+    config.max_window_layers = 0
+    assert select_mdrv_route_layer(config) is None
 
 
-def test_probe_matches_eager_attention_aggregation():
+def test_route_probe_matches_eager_last_row_distribution():
     register_probe_attention_backend()
-    torch.manual_seed(7)
+    torch.manual_seed(11)
     config = Qwen3Config(
         vocab_size=100,
         hidden_size=32,
@@ -61,51 +66,34 @@ def test_probe_matches_eager_attention_aggregation():
     )
     model = Qwen3ForCausalLM(config).eval()
     prefix = torch.randint(0, 100, (1, 10))
-    token = torch.randint(0, 100, (1, 1))
-    selected = (0,)
-    q_start, q_end = 2, 5
-    sink = 0
+    spans = {"A": (0, 3), "O": (3, 5), "P": (5, 8), "C": (8, 10)}
+    route_layer = 3
 
     model.set_attn_implementation("eager")
     with torch.inference_mode():
-        eager_prefill = model(prefix, use_cache=True, logits_to_keep=1)
-        eager_decode = model(
-            token,
-            past_key_values=eager_prefill.past_key_values,
-            use_cache=True,
+        eager = model(
+            prefix,
+            use_cache=False,
             logits_to_keep=1,
             output_attentions=True,
         )
-    key_length = eager_decode.attentions[0].shape[-1]
-    base_rate = (q_end - q_start) / (key_length - 1)
-    base_logit = torch.logit(torch.tensor(base_rate, dtype=torch.float64))
-    eager_values = []
-    for layer in selected:
-        weights = eager_decode.attentions[layer].float()
-        question_mass = weights[..., q_start:q_end].sum(dim=-1)
-        valid_mass = (1.0 - weights[..., sink : sink + 1].sum(dim=-1)).clamp_min(1e-6)
-        relative = (question_mass / valid_mass).clamp(1e-6, 1.0 - 1e-6)
-        eager_values.append(torch.logit(relative) - base_logit)
-    eager_grounding = torch.cat([x.reshape(-1) for x in eager_values]).mean().item()
+    expected = compute_attention_route(eager.attentions[route_layer], spans)
 
     model.set_attn_implementation(BACKEND_NAME)
+    collector = RouteCollector(
+        route_layer=route_layer,
+        region_spans=spans,
+        head_chunk_size=2,
+    )
     with torch.inference_mode():
-        probe_prefill = model(prefix, use_cache=True, logits_to_keep=1)
-        collector = GroundingCollector(
-            selected_layers=frozenset(selected),
-            question_start=q_start,
-            question_end=q_end,
-            sink_positions=(sink,),
-            head_chunk_size=2,
-        )
-        collector.begin_token()
+        collector.begin_boundary()
         model(
-            token,
-            past_key_values=probe_prefill.past_key_values,
-            use_cache=True,
+            prefix,
+            use_cache=False,
             logits_to_keep=1,
-            dcrh_grounding_collector=collector,
+            dcrh_route_collector=collector,
         )
-        probe_grounding = collector.end_token().grounding
+        observed = collector.end_boundary().route_distribution
 
-    assert abs(probe_grounding - eager_grounding) < 1e-5
+    for name in ("A", "O", "P", "C"):
+        assert abs(observed[name] - expected[name]) < 1e-5

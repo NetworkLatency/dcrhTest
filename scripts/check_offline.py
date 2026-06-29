@@ -18,7 +18,7 @@ def main() -> None:
     args = parser.parse_args()
     force_offline_environment()
     cfg = load_config(args.config)
-    cfg.validate(require_references=False)
+    cfg.validate(require_tau=False)
     if Version(transformers.__version__) != Version("4.57.6"):
         raise RuntimeError(
             f"This release requires transformers==4.57.6; found {transformers.__version__}"

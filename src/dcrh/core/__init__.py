@@ -1,1 +1,1 @@
-"""Core controller, monitor, calibration, and accounting modules."""
+"""Core MDRV controller, boundary, routing, and accounting modules."""

@@ -1,24 +1,65 @@
-# Core state machine and accounting invariants
+# MDRV Design Notes
 
 ```text
-SLM_ACTIVE
-  | persistent H or G alarm
-  | estimate onset and discard suffix
+SLM trace
+  |
+  | replay completed "\n\n" boundaries
   v
-LLM_REPAIR -- both LLM channels settle --> SLM_TRIAL
-     ^                                      |
-     | rejected trial; full LLM re-prefill  | two blocks safe
-     +--------------------------------------+----> SLM_ACTIVE
+TPM margin drawdown
+  |
+  | drawdown > 0
+  v
+optional A/O/P/C route velocity discount
+  |
+  | risk >= tau
+  v
+rollback to active segment anchor -> LLM takeover
 ```
 
 ## Invariants
 
-1. Decisions occur only at a completed double-newline boundary.
-2. Atomic boundaries store text/token offsets and scalar statistics, never KV tensors.
-3. A model switch always creates a new full-prefix prefill.
-4. The H and G CUSUM states are independent; no weighted or multiplicative cross-signal fusion is used.
-5. Correctness labels are never used to define G, choose layers, choose sinks, or make online transitions.
-6. Escalation is an OR event; return is an AND event.
-7. Every generated token is counted even if later discarded.
-8. Every rejected-trial prefill is counted as wasted prefill.
-9. The published core permits one repair–handoff episode; later failure is delegated to LLM completion.
+1. Controller decisions are made only at completed `"\n\n"` boundaries.
+2. The delimiter is part of the current chunk `C` in this first implementation.
+3. The main TPM query position is the effective pre-action state, not the first
+   generated content token after the boundary.
+4. Effective pre-action state skips over post-boundary whitespace, special
+   tokens, and pure punctuation before the first content token.
+5. TPM uses full-vocabulary raw logits and computes `p_top1 - p_top2`.
+6. Attention route is lazy: it is attempted only when margin drawdown is
+   positive.
+7. Route attention is never computed from a layer identified as sliding-window.
+8. Route mass is region-length normalized before becoming an `A/O/P/C`
+   distribution.
+9. The attention query self-position is excluded from route regions.
+10. If route attention is unavailable, risk falls back to TPM-only drawdown and
+    the step records the unavailability reason.
+11. The rollback anchor is the first low-margin boundary in the active drawdown
+    segment.
+12. A model switch creates a fresh full-prefix prefill. No boundary KV snapshot
+    is stored or transferred.
+13. Correct answers are used only by the offline verifier after generation, not
+    by routing decisions.
+
+## Region Semantics
+
+At boundary `i`, generated chunks are partitioned as:
+
+- `A`: base prompt.
+- `O`: older reasoning chunks before the previous chunk.
+- `P`: previous chunk.
+- `C`: current chunk, including the closing `"\n\n"` delimiter.
+
+For the first and second chunks, missing `O` or `P` regions are represented as
+empty spans. Empty regions receive zero route mass.
+
+## Fallback Behavior
+
+MDRV remains runnable when attention route is disabled or unavailable. In that
+case:
+
+```text
+R_i = G_i
+```
+
+where `G_i` is margin drawdown. The result row still logs TPM, drawdown, and
+`attention_available=false`.

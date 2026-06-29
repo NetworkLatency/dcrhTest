@@ -28,7 +28,7 @@ def main() -> None:
 
     force_offline_environment()
     cfg = load_config(args.config)
-    cfg.validate(require_references=False)
+    cfg.validate(require_tau=False)
     model_cfg = cfg.models.slm if args.role == "slm" else cfg.models.llm
     default_cap = (
         cfg.generation.max_initial_slm_tokens
@@ -63,7 +63,6 @@ def main() -> None:
             "mode": f"{args.role}_only",
             "max_tokens": max_tokens,
             "model": runner.model_metadata(),
-            "grounding_probe_enabled": False,
             "offline_only": True,
             "kv_policy": "live_session_only_no_snapshots",
         },
@@ -84,7 +83,6 @@ def main() -> None:
                 control_text="",
                 purpose=f"{args.role}_only",
                 ledger=ledger,
-                enable_grounding=False,
             )
             terminal_reason = "token_budget"
             for _ in range(max_tokens):
@@ -104,8 +102,6 @@ def main() -> None:
                 "mode": f"{args.role}_only",
                 "final_text": final_text if cfg.output.save_full_text else "",
                 "terminal_reason": terminal_reason,
-                "repair_episodes": 0,
-                "trial_attempts": 0,
                 "cost": ledger.summary(),
                 "evaluation": verify(
                     output=final_text,
