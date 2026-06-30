@@ -1,0 +1,44 @@
+seed: 2026
+prompt_style: aime
+deduplicate: true
+shuffle_output: true
+
+# For AIME24/25 target evaluation, avoid making the calibration distribution too
+# easy. A reasonable first pass is 20% simple, 40% medium, 40% hard.
+mix:
+  simple: 100
+  medium: 200
+  hard: 200
+
+output: outputs/tau_calibration/math_mixed_calibration.jsonl
+summary: outputs/tau_calibration/math_mixed_calibration.summary.json
+
+sources:
+  - name: math500
+    difficulty: simple
+    path: /ABSOLUTE/PATH/TO/math500.jsonl
+    format: auto
+    id_fields: [id, problem_id]
+    question_fields: [problem, question, prompt]
+    answer_fields: [answer, final_answer, target, solution]
+
+  - name: amc2023
+    difficulty: medium
+    path: /ABSOLUTE/PATH/TO/amc2023.jsonl
+    format: auto
+    id_fields: [id, problem_id]
+    question_fields: [problem, question, prompt]
+    answer_fields: [answer, final_answer, target, solution]
+
+  - name: olympiadbench_math
+    difficulty: hard
+    path: /ABSOLUTE/PATH/TO/olympiadbench_math.jsonl
+    format: auto
+    id_fields: [id, question_id, problem_id]
+    question_fields: [problem, question, prompt]
+    answer_fields: [answer, final_answer, target, solution]
+    # Optional exact-match filters. Adjust field names to match your local file.
+    # filters:
+    #   subject: Mathematics
+    #   language: English
+    #   split: test

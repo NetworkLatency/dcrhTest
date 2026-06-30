@@ -9,6 +9,7 @@ backends, benchmark utilities, and command entrypoints.
 configs/    Example MDRV experiment configuration.
 docs/       Design notes, quickstart, and structure guide.
 examples/   Tiny local dataset examples.
+experiments/ Local experiment utilities that are not part of the package API.
 scripts/    Thin wrappers for source-tree execution.
 server/     vLLM service launcher templates for future worker integration.
 src/dcrh/   Python package.
@@ -32,6 +33,7 @@ src/dcrh/
 
   core/
     protocol.py          Offline MDRV trace replay, rollback, and takeover.
+    scoring.py           SLM trace generation and boundary scoring.
     router_signals.py    TPM, content-token filtering, A/O/P/C routes.
     router_state.py      Margin drawdown and route-velocity risk state.
     boundaries.py        Double-newline boundary detector.
@@ -66,3 +68,8 @@ src/dcrh/
 
 New routing logic should live in `core/`; backend-specific tensor work should
 stay in `runtime/`.
+
+Tau-selection and other paper-specific utilities should live under
+`experiments/` so they can be managed or removed independently from the package.
+Current local experiment utilities include `experiments/tau_selection/` and
+`experiments/calibration_dataset/`.

@@ -136,7 +136,11 @@ class ExperimentConfig:
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
 
-    def validate(self, require_tau: bool = False) -> None:
+    def validate(
+        self,
+        require_tau: bool = False,
+        model_roles: tuple[str, ...] = ("slm", "llm"),
+    ) -> None:
         valid_data_formats = {"auto", "jsonl", "json", "csv", "tsv", "parquet", "hf_disk"}
         if self.data.format not in valid_data_formats:
             raise ValueError(
@@ -147,7 +151,13 @@ class ExperimentConfig:
             raise ValueError(
                 f"data.dataset must be one of {sorted(valid_datasets)} when set"
             )
-        for role, model in (("slm", self.models.slm), ("llm", self.models.llm)):
+        valid_roles = {"slm", "llm"}
+        requested_roles = tuple(str(role) for role in model_roles)
+        unknown_roles = sorted(set(requested_roles).difference(valid_roles))
+        if unknown_roles:
+            raise ValueError(f"Unknown model role(s): {unknown_roles}")
+        for role in requested_roles:
+            model = getattr(self.models, role)
             if model.backend not in {"transformers", "vllm_worker"}:
                 raise ValueError(f"models.{role}.backend must be 'transformers' or 'vllm_worker'")
             if model.probe_mode not in {
